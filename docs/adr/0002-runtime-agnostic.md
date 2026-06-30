@@ -47,14 +47,22 @@ que « lancer un process », n'importe quel runtime marche, du moment que le pro
 
 ## Consequences
 
-- Le superviseur reste **trivialement générique** (un gestionnaire de process). Ajouter un runtime =
-  un nouveau process qui se câble tout seul (son bridge vit dans le produit) → **zéro changement
-  côté superviseur**.
-- `agent-runtime` (infra) livre : l'image de base (binaires runtime + env) **+ le superviseur bête**.
-  **Le câblage (channel/bridge + comment lancer un runtime câblé) est produit**, pas infra.
+- **Le superviseur reste trivialement générique** (un gestionnaire de process) et son **code ne
+  change pas** quand on ajoute un runtime.
+- **Mais ajouter un runtime n'est ni gratuit ni magique.** Concrètement, ajouter Codex demande :
+  1. **baker son binaire/deps dans l'image `agent-runtime`** — l'image **bundle les runtimes
+     qu'elle supporte**, elle n'est pas runtime-vide (infra) ;
+  2. un **bridge Codex dans le repo produit** (≠ channel — p. ex. son relais App-Server) ;
+  3. côté appelant, **demander au superviseur de spawn un `codex`** (pas un `claude`) — un sélecteur
+     de runtime + un id.
+
+  Le « self-wiring » du process = sa **connexion au site** (aller chercher son bridge + se
+  connecter), **pas** l'apparition de son binaire.
+- Le split, donc : **infra = l'image (superviseur + env + binaires runtime)** ; **produit = les
+  bridges + le website + comment lancer un runtime câblé**.
 - Seul Claude colle à l'abonnement aujourd'hui (ADR 0005) ; les autres runtimes portent leur propre
-  réalité auth/billing — mais c'est l'affaire du *process*, pas du superviseur.
+  réalité auth/billing.
 - L'allocation d'un **PTY** (les runtimes sont des TUI) reste une capacité **générique** du
-  superviseur (spawn-with-PTY), pas une connaissance par-runtime → détaillé dans l'ADR Image (0004).
-- **Ouvert** : d'où vient la commande de spawn (le website par-appel vs configurée) — un détail, à
-  fixer au besoin.
+  superviseur (spawn-with-PTY), pas une connaissance par-runtime → ADR Image (0004).
+- **Ouvert** : d'où vient le sélecteur de runtime / la commande (website par-appel vs configuré) +
+  l'id de session — détail à fixer au besoin.
