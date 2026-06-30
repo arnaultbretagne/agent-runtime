@@ -1,4 +1,4 @@
-# ADR 0002 — Le superviseur spawn des process opaques ; les runtimes se câblent eux-mêmes
+# ADR 0002 — The supervisor spawns opaque processes; runtimes wire themselves
 
 ## Status
 
@@ -6,63 +6,60 @@ Proposed — 2026-06-30
 
 ## Context
 
-On veut pouvoir héberger différents runtimes (Claude aujourd'hui ; peut-être Codex/OpenCode plus
-tard) sans ré-architecturer. La tentation est une abstraction « profil de runtime » (des
-descripteurs spawn/auth/bridge/persist) pour que le superviseur *sache gérer* chaque runtime.
-C'est de la sur-ingénierie : au fond, le besoin de la plateforme est **juste de faire tourner des
-process**.
+We want to be able to host different runtimes (Claude today; maybe Codex/OpenCode later) without
+re-architecting. The temptation is a "runtime profile" abstraction (spawn/auth/bridge/persist
+descriptors) so the supervisor *knows how to manage* each runtime. That is over-engineering: at
+bottom, the platform's need is **just to run processes**.
 
 ## Decision
 
-**Le superviseur spawn des process opaques. Rien de plus.**
+**The supervisor spawns opaque processes. Nothing more.**
 
 ```
-POST   /sessions {command}  → lance le process, renvoie un id
+POST   /sessions {command}  → start the process, return an id
 DELETE /sessions/:id        → kill
 GET    /sessions            → list
 ```
 
-Le superviseur n'a **aucune notion** de runtime, de channel, d'auth, ni de « profil ». Il
-**n'interprète pas** ce qu'il lance.
+The supervisor has **no notion** of runtime, channel, auth, or "profile". It **does not interpret**
+what it launches.
 
-**Le câblage est le job du process.** Un process runtime est responsable d'aller chercher ce qu'il
-lui faut pour **se câbler au website** : Claude récupère/utilise son **channel** (un plugin MCP) ;
-un futur Codex irait chercher son **propre bridge** (relais App-Server), différent d'un channel.
-**Ce code de bridge vit dans le repo produit**, et c'est le *process* qui va le piocher — pas le
-superviseur.
+**Wiring is the process's job.** A runtime process is responsible for fetching what it needs to
+**wire itself to the website**: Claude fetches/uses its **channel** (an MCP plugin); a future Codex
+would fetch its **own bridge** (App-Server relay), different from a channel. **That bridge code lives
+in the product repo**, and it is the *process* that pulls it in — not the supervisor.
 
-Donc le **runtime-agnosticisme est structurel, pas une feature** : parce que le superviseur ne sait
-que « lancer un process », n'importe quel runtime marche, du moment que le process sait se câbler.
+So **runtime-agnosticism is structural, not a feature**: because the supervisor only knows how to
+"launch a process", any runtime works, as long as the process knows how to wire itself.
 
 ## Rationale
 
-- **Zéro templating / zéro framework de profils.** On a un seul runtime. Une abstraction de profil
-  (descripteurs auth/bridge/persist) = de la machinerie spéculative. Le minimum honnête : spawn un
-  process.
-- **Le process est le bon propriétaire de son câblage.** Auth, récupération du bridge, connexion au
-  site — c'est spécifique au runtime et auto-contenu ; le remonter dans le superviseur le
-  re-coupterait à chaque runtime (exactement ce qu'on évite).
-- **Ce qui varie par runtime reste hors du superviseur** : la commande de spawn (une string) + le
-  code de câblage (dans le repo produit). Aucun des deux ne devient une abstraction dans l'infra.
+- **Zero templating / zero profile framework.** We have a single runtime. A profile abstraction
+  (auth/bridge/persist descriptors) = speculative machinery. The honest minimum: spawn a process.
+- **The process is the right owner of its wiring.** Auth, fetching the bridge, connecting to the
+  site — that is runtime-specific and self-contained; hoisting it into the supervisor would re-couple
+  it to every runtime (exactly what we avoid).
+- **What varies per runtime stays out of the supervisor**: the spawn command (a string) + the wiring
+  code (in the product repo). Neither becomes an abstraction in the infra.
 
 ## Consequences
 
-- **Le superviseur reste trivialement générique** (un gestionnaire de process) et son **code ne
-  change pas** quand on ajoute un runtime.
-- **Mais ajouter un runtime n'est ni gratuit ni magique.** Concrètement, ajouter Codex demande :
-  1. **baker son binaire/deps dans l'image `agent-runtime`** — l'image **bundle les runtimes
-     qu'elle supporte**, elle n'est pas runtime-vide (infra) ;
-  2. un **bridge Codex dans le repo produit** (≠ channel — p. ex. son relais App-Server) ;
-  3. côté appelant, **demander au superviseur de spawn un `codex`** (pas un `claude`) — un sélecteur
-     de runtime + un id.
+- **The supervisor stays trivially generic** (a process manager) and its **code does not change**
+  when a runtime is added.
+- **But adding a runtime is neither free nor magic.** Concretely, adding Codex requires:
+  1. **baking its binary/deps into the `agent-runtime` image** — the image **bundles the runtimes it
+     supports**, it is not runtime-empty (infra);
+  2. a **Codex bridge in the product repo** (≠ channel — e.g. its App-Server relay);
+  3. caller-side, **asking the supervisor to spawn a `codex`** (not a `claude`) — a runtime selector
+     + an id.
 
-  Le « self-wiring » du process = sa **connexion au site** (aller chercher son bridge + se
-  connecter), **pas** l'apparition de son binaire.
-- Le split, donc : **infra = l'image (superviseur + env + binaires runtime)** ; **produit = les
-  bridges + le website + comment lancer un runtime câblé**.
-- Seul Claude colle à l'abonnement aujourd'hui (ADR 0005) ; les autres runtimes portent leur propre
-  réalité auth/billing.
-- L'allocation d'un **PTY** (les runtimes sont des TUI) reste une capacité **générique** du
-  superviseur (spawn-with-PTY), pas une connaissance par-runtime → ADR Image (0004).
-- **Ouvert** : d'où vient le sélecteur de runtime / la commande (website par-appel vs configuré) +
-  l'id de session — détail à fixer au besoin.
+  The process's "self-wiring" = its **connection to the site** (fetching its bridge + connecting),
+  **not** the appearance of its binary.
+- The split, then: **infra = the image (supervisor + env + runtime binaries)**; **product = the
+  bridges + the website + how to launch a wired runtime**.
+- Only Claude sticks to the subscription today (ADR 0005); other runtimes carry their own
+  auth/billing reality.
+- Allocating a **PTY** (runtimes are TUIs) stays a **generic** capability of the supervisor
+  (spawn-with-PTY), not per-runtime knowledge → Image ADR (0004).
+- **Open**: where the runtime selector / command comes from (website per-call vs configured) + the
+  session id — a detail to settle as needed.

@@ -1,4 +1,4 @@
-# ADR 0004 — L'image agent-runtime : générique, non-root, deps bakées, état sur PVC
+# ADR 0004 — The agent-runtime image: generic, non-root, baked-in deps, state on PVC
 
 ## Status
 
@@ -6,75 +6,72 @@ Proposed — 2026-06-30
 
 ## Context
 
-Le MVP a été monté **à la main** dans un pod stock (`oven/bun`) : deps installées au runtime, `bun`
-symlinké, onboarding/trust/bypass drivés au tmux, creds posées par login, claude+socat en sessions
-tmux. **Non reproductible** — un restart perdait tout (deps apt, symlink, sessions). L'image doit
-**figer ce qui doit l'être**, pour un démarrage **propre, identique, restart-safe**.
+The MVP was set up **by hand** in a stock pod (`oven/bun`): deps installed at runtime, `bun` symlinked,
+onboarding/trust/bypass driven through tmux, credentials laid down by login, claude+socat in tmux
+sessions. **Not reproducible** — a restart lost everything (apt deps, symlink, sessions). The image
+must **freeze what must be frozen**, for a **clean, identical, restart-safe** startup.
 
 ## Decision
 
-L'image `agent-runtime` **bake l'infra, monte l'état, ignore le produit.**
+The `agent-runtime` image **bakes the infra, mounts the state, ignores the product.**
 
-**Bakées (image) :**
+**Baked-in (image):**
 
-- Base **Node LTS** (image Debian-slim, pour `apt`), **user non-root** (skip-permissions l'exige —
-  ADR 0003). *(Stack : le superviseur **et** le channel sont en **Node/TypeScript** — cf. Rationale.)*
-- Deps système **bakées, pas installées au runtime** : `git`, `curl`, `ca-certificates`, `tini`.
-  *(Le `socat` du MVP est abandonné : il ne servait qu'à ponter le serveur localhost de fakechat ;
-  dans le design découplé le channel **se connecte au website en sortant**, aucun serveur entrant à
-  ponter.)*
-- **Le runtime du channel (`node`) sur un PATH standard** — sinon le spawn MCP du channel ne le
-  trouve pas (leçon MVP, où c'était `bun` introuvable depuis le spawn).
-- **Les binaires runtime** (Claude aujourd'hui ; l'image *bundle* les runtimes supportés — ADR 0002).
-- **Le superviseur** (ADR 0001).
-- **Le seed d'onboarding** dans `~/.claude.json` (racine du HOME) : onboarding / theme / trust du
-  workdir / bypass **pré-acceptés** → **zéro prompt interactif**. Éphémère (re-seedé à chaque boot,
-  ce ne sont que des flags).
+- Base **Node LTS** (Debian-slim image, for `apt`), **non-root user** (skip-permissions requires it —
+  ADR 0003). *(Stack: the supervisor **and** the channel are in **Node/TypeScript** — cf. Rationale.)*
+- System deps **baked-in, not installed at runtime**: `git`, `curl`, `ca-certificates`, `tini`. *(The
+  MVP's `socat` is dropped: it only served to bridge fakechat's localhost server; in the decoupled
+  design the channel **connects outward to the website**, no inbound server to bridge.)*
+- **The channel's runtime (`node`) on a standard PATH** — otherwise the channel's MCP spawn does not
+  find it (MVP lesson, where it was `bun` not found from the spawn).
+- **The runtime binaries** (Claude today; the image *bundles* the supported runtimes — ADR 0002).
+- **The supervisor** (ADR 0001).
+- **The onboarding seed** in `~/.claude.json` (HOME root): onboarding / theme / workdir trust / bypass
+  **pre-accepted** → **zero interactive prompt**. Ephemeral (re-seeded at each boot, these are just
+  flags).
 
-**Montées (PVC, pas bakées) :**
+**Mounted (PVC, not baked-in):**
 
 - `~/.claude/.credentials.json` (auth — ADR 0006), `~/.claude/projects` (conversations),
-  `~/.claude/plugins` (le **channel**, produit, installé là).
-- → **le PVC est monté sur le dossier `~/.claude`** ; le fichier `~/.claude.json` (racine HOME) reste
-  bakable/seedé. Ça sépare proprement **config-baked** et **état-persistant**.
+  `~/.claude/plugins` (the **channel**, product, installed there).
+- → **the PVC is mounted on the `~/.claude` directory**; the `~/.claude.json` file (HOME root) stays
+  bakable/seeded. This cleanly separates **baked config** and **persistent state**.
 
-**Hors image :** le channel (produit, plugin sur PVC), le website (pod séparé), les secrets (SOPS).
+**Out of image:** the channel (product, plugin on PVC), the website (separate pod), the secrets (SOPS).
 
-**PTY :** le superviseur **alloue lui-même un PTY par process** via **`node-pty`**, en détient le
-master, garde le process vivant. **Pas de tmux/dtach** : un détenteur externe n'aurait de valeur que
-pour faire survivre une session à un *restart-superviseur-sans-restart-pod* — qui n'existe pas (le
-superviseur = le process principal du pod ⇒ s'il tombe, le pod redémarre et tout tombe, repris via
-`--resume`). Le PTY satisfait juste le besoin de TTY du TUI ; **la conversation passe par le
-channel**, pas par le PTY.
+**PTY:** the supervisor **allocates a PTY per process itself** via **`node-pty`**, holds the master,
+keeps the process alive. **No tmux/dtach**: an external holder would only have value to make a session
+survive a *supervisor-restart-without-pod-restart* — which does not exist (the supervisor = the pod's
+main process ⇒ if it falls, the pod restarts and everything falls, resumed via `--resume`). The PTY
+just satisfies the TUI's TTY need; **the conversation goes through the channel**, not the PTY.
 
-**Cycle de vie = version du runtime.** Une maj de Claude Code = **une nouvelle image** (couplage
-voulu : l'image suit ses composants).
+**Lifecycle = runtime version.** A Claude Code update = **a new image** (intended coupling: the image
+tracks its components).
 
 ## Rationale
 
-- **Pourquoi tout baker (vs install-au-runtime)** — le MVP l'a payé : non reproductible, perdu au
-  restart, OOM en plein `apt`. Baker = démarrage déterministe + restart-safe.
-- **Pourquoi non-root + runtime-du-channel-sur-PATH** — deux leçons dures : skip-permissions refuse
-  root ; le spawn MCP du channel cherche son runtime sur un PATH standard.
-- **Pourquoi Node (pas Bun)** — le superviseur a besoin d'un **PTY fiable** (`node-pty`, addon natif
-  rock-solid sur Node, hasardeux sur Bun) ; et le **MCP SDK est node-natif**. Les atouts de Bun
-  (vitesse, TS direct) ne valent pas le risque sur la seule dépendance critique (le PTY). Node = le
-  choix sûr/standard pour le superviseur **et** le channel. *(fakechat-en-Bun n'était que la réf MVP
-  jetable.)*
-- **Pourquoi le split `~/.claude.json` (baked) vs `~/.claude/` (PVC)** — l'onboarding/trust/bypass
-  sont statiques → bakables ; creds/convos/plugins sont de l'état → PVC. Monter le PVC sur le dossier
-  `.claude` et laisser le fichier `.claude.json` bakable sépare les deux sans bricolage.
-- **Pourquoi le superviseur possède le PTY (pas tmux)** — il est déjà propriétaire des process
-  (ADR 0001) ; une lib pty suffit, sans multiplexeur externe. Le PTY n'est pas le canal d'I/O
-  (c'est le channel).
-- **Pourquoi cycle = version du runtime** — l'image ne change que quand ses composants changent
-  (Claude Code, deps). C'est le couplage propre voulu.
+- **Why bake everything (vs install-at-runtime)** — the MVP paid for it: not reproducible, lost on
+  restart, OOM mid-`apt`. Baking = deterministic startup + restart-safe.
+- **Why non-root + channel-runtime-on-PATH** — two hard lessons: skip-permissions refuses root; the
+  channel's MCP spawn looks for its runtime on a standard PATH.
+- **Why Node (not Bun)** — the supervisor needs a **reliable PTY** (`node-pty`, a native addon
+  rock-solid on Node, dicey on Bun); and the **MCP SDK is node-native**. Bun's strengths (speed, direct
+  TS) do not outweigh the risk on the single critical dependency (the PTY). Node = the safe/standard
+  choice for the supervisor **and** the channel. *(fakechat-in-Bun was only the disposable MVP
+  reference.)*
+- **Why the `~/.claude.json` (baked) vs `~/.claude/` (PVC) split** — onboarding/trust/bypass are static
+  → bakable; credentials/convos/plugins are state → PVC. Mounting the PVC on the `.claude` directory
+  and leaving the `.claude.json` file bakable separates the two without hacks.
+- **Why the supervisor owns the PTY (not tmux)** — it already owns the processes (ADR 0001); a pty lib
+  suffices, with no external multiplexer. The PTY is not the I/O channel (the channel is).
+- **Why lifecycle = runtime version** — the image changes only when its components change (Claude Code,
+  deps). That is the intended clean coupling.
 
 ## Consequences
 
-- Démarrage **propre et identique** à chaque boot ; fin du bricolage manuel (le scratch pod du MVP
-  *devient* cette image).
-- L'image **grossit** avec les runtimes bundlés (Claude ; + Codex un jour) — acceptable.
-- L'**auth** n'est pas dans l'image (PVC — ADR 0006) ; le **channel** non plus (produit, plugin PVC).
-- **Ouvert** : les champs exacts de `~/.claude.json` à seeder (les noms ont bougé entre versions — à
-  vérifier sur la version bakée).
+- **Clean and identical** startup at each boot; end of manual fiddling (the MVP's scratch pod *becomes*
+  this image).
+- The image **grows** with the bundled runtimes (Claude; + Codex one day) — acceptable.
+- The **auth** is not in the image (PVC — ADR 0006); neither is the **channel** (product, PVC plugin).
+- **Open**: the exact fields of `~/.claude.json` to seed (names have shifted between versions — to
+  verify against the baked version).

@@ -1,4 +1,4 @@
-# ADR 0003 — Modèle de sécurité : le pod EST la frontière
+# ADR 0003 — Security model: the pod IS the boundary
 
 ## Status
 
@@ -6,66 +6,68 @@ Proposed — 2026-06-30
 
 ## Context
 
-Le runtime fait tourner un agent qui **exécute du code généré par LLM** — donc sujet à l'injection
-de prompt. Le réflexe classique serait de **durcir l'intérieur** du pod (readonly-fs,
-micro-gestion des capabilities, egress ultra-restreint…). Mais **un agent trop bridé est inutile** :
-il doit pouvoir installer des paquets, cloner du code public, browser, atteindre l'API Anthropic.
-Et au fond, **si on se paie la complexité de k8s, c'est justement pour avoir des pods isolables** —
-faire ce qu'on veut *dedans* sans crainte, parce que la **frontière** protège le reste.
+The runtime runs an agent that **executes LLM-generated code** — hence subject to prompt injection.
+The classic reflex would be to **harden the inside** of the pod (readonly-fs, micro-managed
+capabilities, ultra-restricted egress…). But **an over-restricted agent is useless**: it must be able
+to install packages, clone public code, browse, reach the Anthropic API. And fundamentally, **if we
+pay the complexity of k8s, it is precisely to get isolable pods** — do whatever we want *inside*
+without fear, because the **boundary** protects the rest.
 
-Contexte concret : on bosse sur du **code public** (repos GitHub publics). Le token GitHub est donc
-*low-stakes*. **La seule vraie crainte = fuiter des secrets d'infra.** Et l'agent **n'y a pas accès
-par construction** (cf. les deux contrôles ci-dessous).
+Concrete context: we work on **public code** (public GitHub repos). The GitHub token is therefore
+*low-stakes*. **The only real fear = leaking infra secrets.** And the agent **has no access to them by
+construction** (cf. the two controls below).
 
 ## Decision
 
-**Le pod EST la frontière d'isolation. Dedans l'agent est libre ; dehors il est borné.**
+**The pod IS the isolation boundary. Inside, the agent is free; outside, it is bounded.**
 
-On ne durcit **pas** l'intérieur (pas de readonly-fs paranoïaque, pas de capabilities micro-gérées
-qui rendent l'agent débile). À la place, **deux contrôles de frontière — cheap et habilitants** :
+We do **not** harden the inside (no paranoid readonly-fs, no micro-managed capabilities that make the
+agent dumb). Instead, **two boundary controls — cheap and enabling**:
 
-1. **Pas d'accès à l'API K8s** : `automountServiceAccountToken: false`. Le pod ne porte **aucun**
-   credential cluster.
-2. **Egress = internet large, intra-cluster fermé** (CiliumNetworkPolicy) :
-   - **allow** : internet (Anthropic, GitHub, npm/pip, browsing…), le **website** (le seul pair
-     in-cluster dont le channel a besoin), et **DNS**.
-   - **deny** : tout le reste de l'intra-cluster — kube-apiserver, pocket-id, CNPG, les autres
+1. **No access to the K8s API**: `automountServiceAccountToken: false`. The pod carries **no** cluster
+   credential.
+2. **Egress = broad internet, intra-cluster closed** (CiliumNetworkPolicy):
+   - **allow**: internet (Anthropic, GitHub, npm/pip, browsing…), the **website** (the only
+     in-cluster peer the channel needs), and **DNS**.
+   - **deny**: all the rest of intra-cluster — kube-apiserver, pocket-id, CNPG, the other
      apps/secrets.
 
-Dedans, **`--dangerously-skip-permissions`** est acceptable *parce que* le pod est la sandbox
-(l'agent est libre dans sa boîte). *(Le permission-relay via le channel — approuver les outils à
-distance — reste une option future, cf. ADR channels du produit.)*
+Inside, **`--dangerously-skip-permissions`** is acceptable *because* the pod is the sandbox (the agent
+is free in its box). *(Permission-relay via the channel — approving tools remotely — remains a future
+option, cf. the product's channels ADR.)*
 
-**Single-user** : un seul compte (l'opérateur) ; l'accès au website est gated OIDC (infra) et
-l'abonnement est mono-tenant (contrainte Terms, ADR 0005).
+**Single-user**: a single account (the operator); website access is OIDC-gated (infra) and the
+subscription is single-tenant (Terms constraint, ADR 0005).
 
 ## Rationale
 
-- **Pourquoi pas de durcissement interne** — l'utilité de l'agent EXIGE qu'il soit libre dedans
-  (installer, cloner, fetch). Le brider le casse. La valeur de k8s ici = la **frontière du pod**,
-  pas mille restrictions internes.
-- **Pourquoi ces deux contrôles précisément** — ils sont *la construction* sur laquelle repose
-  « l'agent n'atteint pas l'infra ». No-SA-token + deny-intra-egress = l'agent fait ce qu'il veut
-  **vers le dehors** mais est **aveugle au-dedans**, là où vivent les secrets infra. C'est ça qui
-  borne le blast-radius.
-- **Threat model honnête** — l'agent exécute du code LLM ⇒ injection possible. Mais que peut-il
-  exfiltrer ? Le contenu de **son** pod : les creds d'abonnement Claude + du code public + un token
-  GitHub scoped. **Aucun secret d'infra (inatteignable).** Les creds Claude qui fuiraient = ennuyeux
-  mais **borné + rotatable**. On accepte l'egress internet large comme le coût d'un agent utile, la
-  frontière protégeant les vrais actifs.
-- **Disposabilité = sécurité** — le pod est jetable/remplaçable → une compromission **ne persiste
-  pas** (nuke + recrée).
+- **Why no internal hardening** — the agent's usefulness REQUIRES it to be free inside (install,
+  clone, fetch). Restraining it breaks it. The value of k8s here = the **pod boundary**, not a
+  thousand internal restrictions.
+- **Why these two controls precisely** — they are *the construction* on which "the agent does not
+  reach the infra" rests. No-SA-token + deny-intra-egress = the agent does whatever it wants
+  **outward** but is **blind inward**, where the infra secrets live. That is what bounds the
+  blast-radius.
+- **Honest threat model** — the agent executes LLM code ⇒ injection possible. But what can it
+  exfiltrate? The contents of **its** pod: the Claude subscription credentials + public code + a
+  scoped GitHub token. **No infra secret (unreachable).** Leaked Claude credentials = annoying but
+  **bounded + rotatable**. We accept broad internet egress as the cost of a useful agent, the boundary
+  protecting the real assets.
+- **Disposability = security** — the pod is disposable/replaceable → a compromise **does not persist**
+  (nuke + recreate).
 
 ## Consequences
 
-- Le pod agent-runtime tourne **non-root** (aussi requis par skip-permissions, cf. ADR Image),
-  `automountServiceAccountToken: false`, sous une **CiliumNetworkPolicy** egress
-  (internet + website + DNS ; deny le reste).
-- L'agent est **libre dans le pod** (skip-permissions) ; pas de durcissement interne fragile.
-- Le **website** doit être joignable depuis le pod runtime (allow ciblé) — le channel s'y connecte.
-- **Multi-conv** : les N process partagent **le même pod = la même frontière** (acceptable :
-  même opérateur, même confiance, code public). Pour isoler conv↔conv un jour (code privé, multi-user),
-  il faudrait des **pods/frontières séparés** — hors scope aujourd'hui.
-- Le token GitHub monté reste **scoped + low-stakes** (code public) ; à durcir si on touche du privé.
-- **Ouvert** : permission-relay vs skip-permissions par défaut (le relay est plus « human-in-the-loop »
-  mais fakechat ne le supporte pas ; notre channel pourrait) — affiné côté produit.
+- The agent-runtime pod runs **non-root** (also required by skip-permissions, cf. Image ADR),
+  `automountServiceAccountToken: false`, under an egress **CiliumNetworkPolicy** (internet + website +
+  DNS; deny the rest).
+- The agent is **free inside the pod** (skip-permissions); no fragile internal hardening.
+- The **website** must be reachable from the runtime pod (targeted allow) — the channel connects to
+  it.
+- **Multi-conv**: the N processes share **the same pod = the same boundary** (acceptable: same
+  operator, same trust, public code). To isolate conv↔conv one day (private code, multi-user), it
+  would take **separate pods/boundaries** — out of scope today.
+- The mounted GitHub token stays **scoped + low-stakes** (public code); to harden if we touch private
+  code.
+- **Open**: permission-relay vs skip-permissions by default (the relay is more "human-in-the-loop" but
+  fakechat does not support it; our channel could) — refined on the product side.

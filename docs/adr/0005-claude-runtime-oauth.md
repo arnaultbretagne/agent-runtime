@@ -1,4 +1,4 @@
-# ADR 0005 — Runtime Claude = le TUI interactif sur l'abonnement OAuth
+# ADR 0005 — Claude runtime = the interactive TUI on the OAuth subscription
 
 ## Status
 
@@ -6,51 +6,53 @@ Proposed — 2026-06-30
 
 ## Context
 
-Claude Code se pilote de plusieurs façons : le **TUI interactif** (sur abonnement), le mode
-**headless `claude -p`** / l'**Agent SDK** (programmatique), ou via l'**API Anthropic** (clé,
-facturée au token). Il faut choisir **comment notre runtime Claude tourne.**
+Claude Code can be driven several ways: the **interactive TUI** (on subscription), the **headless
+`claude -p`** mode / the **Agent SDK** (programmatic), or via the **Anthropic API** (key, billed per
+token). We must choose **how our Claude runtime runs.**
 
-Contrainte dure (connaissance opérateur) : **`claude -p` et l'Agent SDK vont être SORTIS de
-l'abonnement** (Anthropic a temporisé, mais c'est acté). Bâtir dessus = **épée de Damoclès** : le
-jour où ça bascule en facturation API, tout le dev repose sur un mode qui coûte au token. Et l'**API**
-elle-même est exclue (coût, ce n'est pas le modèle voulu).
+Hard constraint (operator knowledge): **`claude -p` and the Agent SDK are going to be REMOVED from the
+subscription** (Anthropic has delayed it, but it is settled). Building on them = **sword of Damocles**:
+the day it flips to API billing, all the dev rests on a mode that costs per token. And the **API**
+itself is excluded (cost, it is not the intended model).
 
 ## Decision
 
-**Le runtime Claude = le TUI interactif `claude`, sur l'abonnement OAuth** (firstParty / Max). Point.
+**The Claude runtime = the interactive `claude` TUI, on the OAuth subscription** (firstParty / Max).
+Period.
 
-- **Pas l'API** (clé, facturée au token).
-- **Pas `claude -p` / l'Agent SDK** (programmatique) — ils quittent le forfait.
-- C'est le **claude interactif** : celui que la primitive `channels` cible (push dans la session
-  vivante), celui qui tourne sur l'abonnement de l'opérateur.
+- **Not the API** (key, billed per token).
+- **Not `claude -p` / the Agent SDK** (programmatic) — they leave the subscription.
+- It is the **interactive claude**: the one the `channels` primitive targets (push into the live
+  session), the one running on the operator's subscription.
 
-**Conséquence assumée : le couplage au terminal est irréductible.** claude est un TUI ⇒ il faut un
-**PTY** (ADR 0004), le bridge est **stdio** (channels — côté produit), etc. On ne cherche **pas** à
-le rendre « pur API/headless » : ce chemin n'existe pas pour nous (forfait).
+**Assumed consequence: the coupling to the terminal is irreducible.** claude is a TUI ⇒ it needs a
+**PTY** (ADR 0004), the bridge is **stdio** (channels — product side), etc. We do **not** try to make
+it "pure API/headless": that path does not exist for us (subscription).
 
-**Single-user (clause Terms).** Anthropic interdit d'**offrir le login claude.ai / les rate-limits à
-d'AUTRES utilisateurs** (produit multi-tenant) sans accord. Donc : **l'opérateur, solo, sur son
-abonnement = OK** ; ouvrir l'accès à d'autres = zone grise → **hors scope** (le gate OIDC ne laisse
-passer que l'opérateur).
+**Single-user (Terms clause).** Anthropic forbids **offering the claude.ai login / the rate-limits to
+OTHER users** (multi-tenant product) without agreement. So: **the operator, solo, on their subscription
+= OK**; opening access to others = grey zone → **out of scope** (the OIDC gate only lets the operator
+through).
 
 ## Rationale
 
-- **Pourquoi pas l'API** — coût au token ; ce n'est pas le modèle (on veut le forfait).
-- **Pourquoi pas SDK/`-p`** — ils sortent de l'abonnement (acté) ⇒ Damoclès : on ne bâtit pas le
-  runtime sur un mode dont le billing va basculer.
-- **Pourquoi assumer le couplage terminal** — c'est le prix du forfait. Le **TUI EST le runtime**
-  supporté par l'abonnement ; toute l'archi (PTY, channels-stdio) en découle, et c'est cohérent.
-- **Pourquoi single-user** — la clause Terms ; et de toute façon le pod/abonnement est mono-opérateur
-  par construction (gate OIDC).
+- **Why not the API** — per-token cost; it is not the model (we want the subscription).
+- **Why not SDK/`-p`** — they leave the subscription (settled) ⇒ Damocles: we do not build the runtime
+  on a mode whose billing is about to flip.
+- **Why assume the terminal coupling** — it is the price of the subscription. The **TUI IS the
+  runtime** supported by the subscription; the whole architecture (PTY, channels-stdio) follows from
+  it, and it is coherent.
+- **Why single-user** — the Terms clause; and anyway the pod/subscription is single-operator by
+  construction (OIDC gate).
 
 ## Consequences
 
-- Le runtime Claude est un **process TUI** (PTY — ADR 0004), piloté de l'extérieur via le **channel**
-  (stdio, produit) — pas une API headless.
-- Le **bridge ne peut PAS être un MCP remote** : channels = stdio (cf. ADR channels, produit) →
-  co-localisé avec le runtime.
-- Si Anthropic ouvrait un jour un mode programmatique **stable sur abonnement**, on pourrait
-  reconsidérer — mais **on ne parie pas dessus**.
-- **Multi-tenant interdit** sans accord Anthropic → la plateforme reste single-user (gate OIDC) ; à
-  revisiter seulement pour ouvrir l'accès (et alors : accord + un credential-gateway type OneCLI).
-- L'**auth** de ce runtime (comment se connecter à l'abonnement) = **ADR 0006**.
+- The Claude runtime is a **TUI process** (PTY — ADR 0004), driven from outside via the **channel**
+  (stdio, product) — not a headless API.
+- The **bridge can NOT be a remote MCP**: channels = stdio (cf. channels ADR, product) → co-located
+  with the runtime.
+- If Anthropic one day opened a programmatic mode **stable on subscription**, we could reconsider — but
+  **we do not bet on it**.
+- **Multi-tenant forbidden** without Anthropic's agreement → the platform stays single-user (OIDC
+  gate); to revisit only to open access (and then: agreement + a OneCLI-style credential-gateway).
+- The **auth** of this runtime (how to connect to the subscription) = **ADR 0006**.

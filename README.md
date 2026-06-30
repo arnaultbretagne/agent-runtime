@@ -1,12 +1,12 @@
 # agent-runtime
 
-Brique **infra** : une image générique + un **superviseur thin** qui instancie et gère des
-**sessions de runtime agent** (Claude Code en premier) dans un pod Kubernetes. Chaque session
-fait tourner un agent interactif sur son abonnement, relié à l'extérieur par un **channel**
-(un serveur MCP stdio que l'agent spawn lui-même).
+**Infra** brick: a generic image + a **thin supervisor** that instantiates and manages **agent
+runtime sessions** (Claude Code first) inside a Kubernetes pod. Each session runs an interactive
+agent on its subscription, connected to the outside through a **channel** (a stdio MCP server the
+agent spawns itself).
 
-Ce repo est **agnostique au produit** : il sait *faire tourner des agents*, rien sur les
-conversations, l'UI, ou un channel/website précis. Le produit (channel + website) vit dans son
-propre repo et se branche dessus.
+This repo is **product-agnostic**: it knows how to *run agents*, nothing about conversations, the
+UI, or any specific channel/website. The product (channel + website) lives in its own repo and
+plugs into this one.
 
-Décisions de design : voir [`docs/adr/`](docs/adr/).
+Design decisions: see [`docs/adr/`](docs/adr/).
