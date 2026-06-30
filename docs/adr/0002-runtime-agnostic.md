@@ -1,4 +1,4 @@
-# ADR 0002 — Runtime-agnostic : un runtime est un profil pluggable
+# ADR 0002 — Le superviseur spawn des process opaques ; les runtimes se câblent eux-mêmes
 
 ## Status
 
@@ -6,71 +6,55 @@ Proposed — 2026-06-30
 
 ## Context
 
-L'ADR 0001 a fait du superviseur quelque chose de paramétré par *« quel runtime »*. Cet ADR
-l'acte : la plateforme doit pouvoir héberger **différents runtimes agent**, pas seulement Claude
-Code. Aujourd'hui Claude est le primaire (c'est lui qui tourne sur l'abonnement de l'opérateur),
-mais on veut pouvoir en instancier d'autres (Codex, OpenCode, …) **sans ré-architecturer**.
-
-Point crucial : les runtimes agent **ne sont PAS interchangeables** :
-
-- **L'auth/billing diffère** — Claude = OAuth abonnement (firstParty/Max) ; Codex = abonnement
-  ChatGPT via son *App Server* ; OpenCode/Pi = clés API provider (≠ abonnement).
-- **Le mécanisme de bridge diffère** — Claude *pousse* dans la session vivante via la primitive
-  **`channels`** (MCP stdio) ; Codex expose un **App Server (JSON-RPC)** ; OpenCode expose
-  **ACP / un flux SSE**. (cf. l'ADR adopter-vs-builder du produit / le scout.)
-
-Donc « runtime-agnostic » ne doit **pas** prétendre que tous les runtimes sont équivalents — il
-doit permettre au superviseur d'en héberger plusieurs, chacun portant ses spécificités.
+On veut pouvoir héberger différents runtimes (Claude aujourd'hui ; peut-être Codex/OpenCode plus
+tard) sans ré-architecturer. La tentation est une abstraction « profil de runtime » (des
+descripteurs spawn/auth/bridge/persist) pour que le superviseur *sache gérer* chaque runtime.
+C'est de la sur-ingénierie : au fond, le besoin de la plateforme est **juste de faire tourner des
+process**.
 
 ## Decision
 
-**Un runtime = un profil pluggable.** Le superviseur et l'image **ne codent pas Claude en dur.**
-Un *profil de runtime* encapsule ce que le superviseur a besoin de savoir, et qui varie d'un
-runtime à l'autre :
+**Le superviseur spawn des process opaques. Rien de plus.**
 
-- **comment le spawn** (commande/args, ex. `claude --channels <channel>`),
-- **son auth** (où vivent les creds, comment elles se refresh — ex. `~/.claude/.credentials.json`
-  sur le PVC),
-- **comment un bridge s'attache** (le mécanisme : Claude = un **channel** MCP stdio ; un autre
-  runtime = son mécanisme natif),
-- **où il persiste** sessions/history (ex. `~/.claude/projects` pour Claude).
+```
+POST   /sessions {command}  → lance le process, renvoie un id
+DELETE /sessions/:id        → kill
+GET    /sessions            → list
+```
 
-Le `POST /sessions` du superviseur prend un paramètre `runtime` qui sélectionne le profil. On
-**livre exactement un profil aujourd'hui — Claude** — et on garde l'abstraction **thin** (un profil
-= un petit descripteur spawn/auth/bridge/persist, **pas** un framework de plugins). Les autres
-profils ne sont ajoutés que si un besoin réel apparaît.
+Le superviseur n'a **aucune notion** de runtime, de channel, d'auth, ni de « profil ». Il
+**n'interprète pas** ce qu'il lance.
 
-Deux axes d'agnosticisme distincts, à ne pas confondre :
+**Le câblage est le job du process.** Un process runtime est responsable d'aller chercher ce qu'il
+lui faut pour **se câbler au website** : Claude récupère/utilise son **channel** (un plugin MCP) ;
+un futur Codex irait chercher son **propre bridge** (relais App-Server), différent d'un channel.
+**Ce code de bridge vit dans le repo produit**, et c'est le *process* qui va le piocher — pas le
+superviseur.
 
-- **Runtime-agnostic** (cet ADR) : *quel runtime* + son mécanisme de bridge natif = un paramètre.
-- **Channel-agnostic** (à l'intérieur du profil Claude) : *quel* plugin channel MCP est attaché =
-  un paramètre (fourni par le produit).
+Donc le **runtime-agnosticisme est structurel, pas une feature** : parce que le superviseur ne sait
+que « lancer un process », n'importe quel runtime marche, du moment que le process sait se câbler.
 
 ## Rationale
 
-- **Pourquoi ne pas coder Claude en dur** — le job du superviseur (spawn/héberger/reaper des process
-  agent interactifs avec un PTY) est réellement générique ; y enfouir des spécificités Claude
-  forcerait une réécriture pour ajouter un 2ᵉ runtime et ferait fuiter du détail-runtime dans le
-  cœur d'orchestration.
-- **Pourquoi un « profil » (thin) et pas un framework** — on a exactement un runtime aujourd'hui.
-  Un descripteur thin (spawn/auth/bridge/persist) capture ce qui varie sans machinerie spéculative.
-  YAGNI sur un SDK de plugins.
-- **Pourquoi garder auth/bridge DANS le profil** — c'est précisément ce qui diffère par runtime ;
-  l'isoler là est *ce qui rend le superviseur générique*.
-- **Honnêteté du périmètre** — runtime-agnostic ≠ « tous les runtimes sont égaux ». Seul Claude
-  colle à la contrainte abonnement aujourd'hui (ADR 0005) ; OpenCode/Pi sont facturés API.
-  L'abstraction parle d'*extensibilité sans réécriture*, pas d'une promesse de parité drop-in.
+- **Zéro templating / zéro framework de profils.** On a un seul runtime. Une abstraction de profil
+  (descripteurs auth/bridge/persist) = de la machinerie spéculative. Le minimum honnête : spawn un
+  process.
+- **Le process est le bon propriétaire de son câblage.** Auth, récupération du bridge, connexion au
+  site — c'est spécifique au runtime et auto-contenu ; le remonter dans le superviseur le
+  re-coupterait à chaque runtime (exactement ce qu'on évite).
+- **Ce qui varie par runtime reste hors du superviseur** : la commande de spawn (une string) + le
+  code de câblage (dans le repo produit). Aucun des deux ne devient une abstraction dans l'infra.
 
 ## Consequences
 
-- Superviseur + image restent génériques ; Claude est « juste le premier profil ».
-- Un profil de runtime **s'étale sur deux repos** : la **recette spawn/auth/PTY** ici (infra), et le
-  **code du bridge** dans le repo produit (le channel qui relaie vers le protocole du website).
-  Pour Claude : recette spawn = infra ; plugin channel = produit.
-- Ajouter un runtime plus tard = un nouveau profil (recette infra) + un nouveau bridge (produit) +
-  sa réalité auth/billing (qui peut ne pas coller au modèle abonnement — décision par-runtime).
-- Le website parle un **protocole commun** ; le bridge de chaque runtime **normalise** son mécanisme
-  natif vers ce protocole (le website est donc lui-même runtime-agnostic) — détaillé dans les ADR
-  produit.
-- **Ouvert** : la forme exacte d'un descripteur de « profil » (fichier de conf ? code ?) — à fixer
-  si/quand un 2ᵉ runtime apparaît ; on ne sur-spécifie pas pour un seul runtime.
+- Le superviseur reste **trivialement générique** (un gestionnaire de process). Ajouter un runtime =
+  un nouveau process qui se câble tout seul (son bridge vit dans le produit) → **zéro changement
+  côté superviseur**.
+- `agent-runtime` (infra) livre : l'image de base (binaires runtime + env) **+ le superviseur bête**.
+  **Le câblage (channel/bridge + comment lancer un runtime câblé) est produit**, pas infra.
+- Seul Claude colle à l'abonnement aujourd'hui (ADR 0005) ; les autres runtimes portent leur propre
+  réalité auth/billing — mais c'est l'affaire du *process*, pas du superviseur.
+- L'allocation d'un **PTY** (les runtimes sont des TUI) reste une capacité **générique** du
+  superviseur (spawn-with-PTY), pas une connaissance par-runtime → détaillé dans l'ADR Image (0004).
+- **Ouvert** : d'où vient la commande de spawn (le website par-appel vs configurée) — un détail, à
+  fixer au besoin.
