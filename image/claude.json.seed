@@ -1,0 +1,14 @@
+{
+  "hasCompletedOnboarding": true,
+  "projects": {
+    "/home/node/work": {
+      "hasTrustDialogAccepted": true,
+      "hasCompletedProjectOnboarding": true,
+      "enableAllProjectMcpServers": true,
+      "enabledMcpjsonServers": [],
+      "disabledMcpjsonServers": [],
+      "mcpServers": {},
+      "allowedTools": []
+    }
+  }
+}
