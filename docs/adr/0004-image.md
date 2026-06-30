@@ -32,9 +32,10 @@ The `agent-runtime` image **bakes the infra, mounts the state, ignores the produ
 
 **Mounted (PVC, not baked-in):**
 
-- `~/.claude/.credentials.json` (auth — ADR 0006), `~/.claude/projects` (the agent's **native resume
-  context** — *not* the product conversation, cf. `agora` ADR 0005), `~/.claude/plugins` (the
-  **channel**, product, installed there).
+- `~/.claude/.credentials.json` (auth — ADR 0006), `~/.claude/plugins` (the **channel**, product,
+  installed there). *(`~/.claude/projects` = claude's native session dir — **unused by the product**:
+  the spike showed channel conversations aren't reliably written there, and the history lives in the hub
+  [`agora` ADR 0005]; mounting it is optional.)*
 - → **the PVC is mounted on the `~/.claude` directory**; the `~/.claude.json` file (HOME root) stays
   bakable/seeded. This cleanly separates **baked config** and **persistent state**.
 
@@ -43,10 +44,11 @@ The `agent-runtime` image **bakes the infra, mounts the state, ignores the produ
 **PTY:** the supervisor **allocates a PTY per process itself** via **`node-pty`**, holds the master,
 keeps the process alive. **No tmux/dtach**: an external holder would only have value to make a session
 survive a *supervisor-restart-without-pod-restart* — which does not exist (the supervisor is the pod's
-**main workload**, with `tini` as PID 1 reaping zombies ⇒ if the supervisor falls, the pod restarts
-and everything falls, to be **resumed via `--resume`**). *(Resume behavior — its directory-scoped
-lookup and version-fragile JSONL format — is being validated, cf. `agora` ADR 0005's spike.)* The PTY
-just satisfies the TUI's TTY need; **the conversation goes through the channel**, not the PTY.
+**main workload**, with `tini` as PID 1 reaping zombies ⇒ if the supervisor falls, the pod restarts and
+everything falls, to be **re-seeded from the hub's history** — `agora` ADR 0005; the spike showed
+claude's native `--resume` does **not** reliably restore a channel conversation, so recovery is
+re-seed, not resume). The PTY just satisfies the TUI's TTY need; **the conversation goes through the
+channel**, not the PTY.
 
 **Lifecycle = runtime version.** A Claude Code update = **a new image** (intended coupling: the image
 tracks its components).
@@ -76,6 +78,8 @@ tracks its components).
   this image).
 - The image **grows** with the bundled runtimes (Claude; + Codex one day) — acceptable.
 - The **auth** is not in the image (PVC — ADR 0006); neither is the **channel** (product, PVC plugin).
-- **Open / spike**: the exact fields of `~/.claude.json` to seed (names have shifted between versions —
-  to verify against the baked version); and **how the channel is enabled** for claude (a forwarded
-  `--channels` flag vs PVC plugin config — cf. `agora` ADR 0002/0003).
+- **Channel enablement — spike-confirmed**: a `--channels` / `--dangerously-load-development-channels`
+  flag **+** the channel MCP server (plugin or `.mcp.json`) **+** `--allowedTools` for its reply tool
+  (`agora` ADR 0002/0003). **Open**: the exact `~/.claude.json` seed fields — incl.
+  `projects["<cwd>"].hasTrustDialogAccepted: true` to skip the trust / MCP / dev-channel prompts (the
+  spike hit all three) — to bake into the image.
