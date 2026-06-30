@@ -32,8 +32,9 @@ The `agent-runtime` image **bakes the infra, mounts the state, ignores the produ
 
 **Mounted (PVC, not baked-in):**
 
-- `~/.claude/.credentials.json` (auth — ADR 0006), `~/.claude/projects` (conversations),
-  `~/.claude/plugins` (the **channel**, product, installed there).
+- `~/.claude/.credentials.json` (auth — ADR 0006), `~/.claude/projects` (the agent's **native resume
+  context** — *not* the product conversation, cf. `agora` ADR 0005), `~/.claude/plugins` (the
+  **channel**, product, installed there).
 - → **the PVC is mounted on the `~/.claude` directory**; the `~/.claude.json` file (HOME root) stays
   bakable/seeded. This cleanly separates **baked config** and **persistent state**.
 
@@ -41,8 +42,10 @@ The `agent-runtime` image **bakes the infra, mounts the state, ignores the produ
 
 **PTY:** the supervisor **allocates a PTY per process itself** via **`node-pty`**, holds the master,
 keeps the process alive. **No tmux/dtach**: an external holder would only have value to make a session
-survive a *supervisor-restart-without-pod-restart* — which does not exist (the supervisor = the pod's
-main process ⇒ if it falls, the pod restarts and everything falls, resumed via `--resume`). The PTY
+survive a *supervisor-restart-without-pod-restart* — which does not exist (the supervisor is the pod's
+**main workload**, with `tini` as PID 1 reaping zombies ⇒ if the supervisor falls, the pod restarts
+and everything falls, to be **resumed via `--resume`**). *(Resume behavior — its directory-scoped
+lookup and version-fragile JSONL format — is being validated, cf. `agora` ADR 0005's spike.)* The PTY
 just satisfies the TUI's TTY need; **the conversation goes through the channel**, not the PTY.
 
 **Lifecycle = runtime version.** A Claude Code update = **a new image** (intended coupling: the image
@@ -73,5 +76,6 @@ tracks its components).
   this image).
 - The image **grows** with the bundled runtimes (Claude; + Codex one day) — acceptable.
 - The **auth** is not in the image (PVC — ADR 0006); neither is the **channel** (product, PVC plugin).
-- **Open**: the exact fields of `~/.claude.json` to seed (names have shifted between versions — to
-  verify against the baked version).
+- **Open / spike**: the exact fields of `~/.claude.json` to seed (names have shifted between versions —
+  to verify against the baked version); and **how the channel is enabled** for claude (a forwarded
+  `--channels` flag vs PVC plugin config — cf. `agora` ADR 0002/0003).

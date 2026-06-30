@@ -31,19 +31,20 @@ Ship a **thin, generic supervisor** in the `agent-runtime` image: a **runtime se
 exposing a minimal control API.
 
 ```
-POST   /sessions      → spawn a session (a runtime process + its channel) ; returns a session id
-GET    /sessions      → list active sessions
-DELETE /sessions/:id  → kill / reap a session
-GET    /sessions/:id  → status / health
+POST   /sessions {kind, id?, ...params}  → spawn a session ; returns a session id
+GET    /sessions                          → list active sessions
+DELETE /sessions/:id                      → kill / reap a session
+GET    /sessions/:id                      → status / health
 ```
 
-A **session** = exactly one runtime process (e.g. `claude --channels <channel>`), PTY-hosted,
-with its own channel attached. The supervisor is:
+A **session** = exactly one runtime process (e.g. `claude` + its channel), PTY-hosted. The
+supervisor is:
 
-- **Runtime-agnostic** (see ADR 0002): *which* runtime to spawn is a parameter — Claude first,
-  others pluggable.
-- **Channel-agnostic**: *which* channel to attach is a parameter (the product supplies it as a
-  plugin).
+- **Runtime-agnostic** (see ADR 0002): *which* runtime is a **closed `kind`** resolved against a
+  baked registry — Claude first, others pluggable.
+- **Channel-agnostic**: the channel is the runtime's own plugin (product side); the supervisor only
+  forwards a param it does not interpret. *(Exact channel-enablement — a forwarded flag like
+  `--channels …` vs PVC plugin config — is a spike, ADR 0004.)*
 - **Thin**: it carries **no product logic** — no conversation semantics, no UI, no message
   routing, no history. It only manages **process lifecycle**. That is what keeps it *infra*.
 
@@ -79,5 +80,6 @@ product ADRs); the supervisor owns only lifecycle.
   and the product's pluggable channel.
 - **Open / deferred:**
   - PTY hosting per session (how the supervisor allocates a PTY for each runtime) → Image ADR (0004).
-  - Sharing one credential across N processes (refresh-token rotation) → Auth ADR (0006).
+  - Sharing one credential across N processes → **operator-verified fine** (Auth ADR 0006); no
+    per-process strategy needed.
   - Auth/transport of the supervisor API itself (it must only be reachable by the website, in-cluster).

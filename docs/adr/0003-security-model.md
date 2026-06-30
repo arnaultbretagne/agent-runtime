@@ -26,18 +26,26 @@ agent dumb). Instead, **two boundary controls — cheap and enabling**:
 
 1. **No access to the K8s API**: `automountServiceAccountToken: false`. The pod carries **no** cluster
    credential.
-2. **Egress = broad internet, intra-cluster closed** (CiliumNetworkPolicy):
-   - **allow**: internet (Anthropic, GitHub, npm/pip, browsing…), the **website** (the only
-     in-cluster peer the channel needs), and **DNS**.
+2. **Network = intra-cluster closed but for two declared holes** (CiliumNetworkPolicy):
+   - **egress allow**: internet (Anthropic, GitHub, npm/pip, browsing…), the **website** (the only
+     in-cluster peer the channel dials out to), and **DNS**.
+   - **ingress allow**: the **website → the supervisor API** only (the control plane; the website is
+     the supervisor's sole client — ADR 0001).
    - **deny**: all the rest of intra-cluster — kube-apiserver, pocket-id, CNPG, the other
      apps/secrets.
 
-Inside, **`--dangerously-skip-permissions`** is acceptable *because* the pod is the sandbox (the agent
-is free in its box). *(Permission-relay via the channel — approving tools remotely — remains a future
-option, cf. the product's channels ADR.)*
+Inside, **`--dangerously-skip-permissions`** is the **default** *because* the pod is the sandbox (the
+agent is free in its box). The permission mode is ultimately a **per-conversation parameter chosen
+from agora** (passed through the spawn payload — ADR 0002); **permission-relay** via the channel
+(approving tools remotely) is the **opt-in** alternative (`agora` ADR 0002).
 
-**Single-user**: a single account (the operator); website access is OIDC-gated (infra) and the
-subscription is single-tenant (Terms constraint, ADR 0005).
+**Single-user**: a single account (the operator); website access is OIDC-gated (`infra-k8s` ADR 0021)
+and the subscription is single-tenant (Terms constraint, ADR 0005).
+
+**The supervisor API is the one inbound surface — and it is not an exec channel.** It accepts a
+**closed `kind` + structured params** (ADR 0002), never a raw command, so a compromised or abused
+website cannot make the pod run arbitrary code; its reachability is locked to the website by the
+ingress rule above.
 
 ## Rationale
 
@@ -69,5 +77,6 @@ subscription is single-tenant (Terms constraint, ADR 0005).
   would take **separate pods/boundaries** — out of scope today.
 - The mounted GitHub token stays **scoped + low-stakes** (public code); to harden if we touch private
   code.
-- **Open**: permission-relay vs skip-permissions by default (the relay is more "human-in-the-loop" but
-  fakechat does not support it; our channel could) — refined on the product side.
+- **Decided**: **skip-permissions is the default** (above); the mode becomes a per-conversation
+  parameter from agora, with **relay** as the opt-in (more "human-in-the-loop"; fakechat doesn't
+  support it, our channel could) — `agora` ADR 0002.

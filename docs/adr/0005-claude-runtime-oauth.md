@@ -49,10 +49,11 @@ through).
 
 - The Claude runtime is a **TUI process** (PTY — ADR 0004), driven from outside via the **channel**
   (stdio, product) — not a headless API.
-- The **bridge can NOT be a remote MCP**: channels = stdio (cf. channels ADR, product) → co-located
+- The **bridge can NOT be a remote MCP**: channels = stdio (cf. `agora` ADR 0002) → co-located
   with the runtime.
 - If Anthropic one day opened a programmatic mode **stable on subscription**, we could reconsider — but
   **we do not bet on it**.
 - **Multi-tenant forbidden** without Anthropic's agreement → the platform stays single-user (OIDC
-  gate); to revisit only to open access (and then: agreement + a OneCLI-style credential-gateway).
+  gate, `infra-k8s` ADR 0021); to revisit only to open access (and then: agreement + a **per-user
+  credential gateway / credential broker**).
 - The **auth** of this runtime (how to connect to the subscription) = **ADR 0006**.
