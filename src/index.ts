@@ -1,23 +1,27 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { randomUUID } from 'node:crypto'
 import { Supervisor, BadRequest } from './supervisor.js'
+import { KNOWN_KINDS } from './runtimes.js'
 
 /**
  * Supervisor control API (ADR 0001/0002). The ONLY inbound surface, reachable
  * in-cluster from the website only (ADR 0003 ingress). It is NOT an exec channel:
  * it accepts a closed `kind` + a forwarded argv list (no shell), never a raw command.
  *
- *   POST   /sessions   { kind, id?, args? }  → spawn, returns the session
- *   GET    /sessions                          → list
- *   GET    /sessions/:id                      → status
- *   DELETE /sessions/:id                      → kill / reap
+ *   POST   /sessions   { kind, id?, args?, env? }  → spawn, returns the session
+ *                        (env: CHANNEL_*-prefixed pipe config only)
+ *   GET    /sessions                                → list
+ *   GET    /sessions/:id                            → status
+ *   DELETE /sessions/:id                            → kill / reap
+ *   GET    /kinds                                   → the baked runtime registry
  *   GET    /healthz
  */
 const PORT = Number(process.env.PORT ?? 8080)
 const HOST = process.env.HOST ?? '0.0.0.0'
 const RUNTIME_CWD = process.env.RUNTIME_CWD ?? process.cwd()
+const PTY_LOG_DIR = process.env.PTY_LOG_DIR || undefined
 
-const sup = new Supervisor({ cwd: RUNTIME_CWD })
+const sup = new Supervisor({ cwd: RUNTIME_CWD, ptyLogDir: PTY_LOG_DIR })
 
 const server = createServer(async (req, res) => {
   try {
@@ -26,6 +30,7 @@ const server = createServer(async (req, res) => {
     const method = req.method ?? 'GET'
 
     if (path === '/healthz') return send(res, 200, { ok: true })
+    if (path === '/kinds' && method === 'GET') return send(res, 200, { kinds: KNOWN_KINDS })
 
     if (path === '/sessions') {
       if (method === 'GET') return send(res, 200, { sessions: sup.list() })
@@ -34,7 +39,8 @@ const server = createServer(async (req, res) => {
         if (typeof body.kind !== 'string') throw new BadRequest('`kind` (string) is required')
         const id = typeof body.id === 'string' && body.id ? body.id : randomUUID()
         const args = Array.isArray(body.args) ? body.args.map(String) : []
-        return send(res, 201, sup.spawn(body.kind, id, args))
+        const env = envParam(body.env)
+        return send(res, 201, sup.spawn(body.kind, id, args, env))
       }
       return send(res, 405, { error: 'method not allowed' })
     }
@@ -67,6 +73,14 @@ server.listen(PORT, HOST, () => {
 function send(res: ServerResponse, code: number, body: unknown): void {
   res.writeHead(code, { 'content-type': 'application/json' })
   res.end(JSON.stringify(body))
+}
+
+function envParam(raw: unknown): Record<string, string> {
+  if (raw === undefined || raw === null) return {}
+  if (typeof raw !== 'object' || Array.isArray(raw)) throw new BadRequest('`env` must be an object')
+  const env: Record<string, string> = {}
+  for (const [k, v] of Object.entries(raw)) env[k] = String(v)
+  return env
 }
 
 async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {

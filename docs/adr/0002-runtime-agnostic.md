@@ -79,6 +79,14 @@ wire itself.
   supervisor only *forwards*, it does not understand the channel.
 - The split: **infra = the image (supervisor + env + runtime binaries + the `kind` registry)**;
   **product = the bridges + the website + which `kind`/params to launch**.
+- **Concrete surface (built 2026-07-01).** The structured payload is realised as **`args`** (argv,
+  forwarded verbatim) **+ `env`** (extra process env). `env` keys are **restricted to the `CHANNEL_`
+  prefix** — that carries the pipe config the product's channel reads (hub URL, conversation id, token)
+  without letting the product set `PATH`/`LD_*`/`NODE_OPTIONS` (an env-injection vector), the same way
+  `kind` closes arbitrary exec. A **`GET /kinds`** endpoint exposes the baked registry so the product
+  can present the available runtimes without hard-coding them. (agora's channel is wired purely through
+  `args: [--channels plugin:agora@agora, --allowedTools …]` + `env: { CHANNEL_* }` — the supervisor
+  still interprets none of it.)
 - Only Claude sticks to the subscription today (ADR 0005); other runtimes carry their own auth/billing
   reality.
 - Allocating a **PTY** (runtimes are TUIs) stays a **generic** supervisor capability (spawn-with-PTY),

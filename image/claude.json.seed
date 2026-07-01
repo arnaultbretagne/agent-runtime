@@ -1,5 +1,6 @@
 {
   "hasCompletedOnboarding": true,
+  "bypassPermissionsModeAccepted": true,
   "projects": {
     "/home/node/work": {
       "hasTrustDialogAccepted": true,

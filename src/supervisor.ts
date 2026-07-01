@@ -1,3 +1,5 @@
+import { appendFileSync } from 'node:fs'
+import { join } from 'node:path'
 import * as pty from 'node-pty'
 import { RUNTIMES, KNOWN_KINDS, isKnownKind } from './runtimes.js'
 
@@ -22,6 +24,8 @@ export interface SpawnDefaults {
   cwd: string
   cols?: number
   rows?: number
+  /** If set, each session's PTY output is appended to `<dir>/<id>.pty.log` (debug aid). */
+  ptyLogDir?: string
 }
 
 /**
@@ -35,13 +39,24 @@ export class Supervisor {
 
   constructor(private readonly defaults: SpawnDefaults) {}
 
-  /** Spawn a runtime of `kind` under a PTY, forwarding `args` as argv. */
-  spawn(kind: string, id: string, args: string[]): SessionInfo {
+  /**
+   * Spawn a runtime of `kind` under a PTY, forwarding `args` as argv and `env`
+   * as extra environment. Env keys are restricted to the `CHANNEL_` prefix —
+   * that is the structured "pipe config" params of ADR 0002 (hub URL,
+   * conversation id, token), and the prefix closes the env-injection vector
+   * (PATH, LD_*, NODE_OPTIONS…) the same way `kind` closes arbitrary exec.
+   */
+  spawn(kind: string, id: string, args: string[], env: Record<string, string> = {}): SessionInfo {
     if (!isKnownKind(kind)) {
       throw new BadRequest(`unknown kind: ${kind} (known: ${KNOWN_KINDS.join(', ')})`)
     }
     if (this.sessions.has(id)) {
       throw new BadRequest(`session already exists: ${id}`)
+    }
+    for (const key of Object.keys(env)) {
+      if (!/^CHANNEL_[A-Z0-9_]+$/.test(key)) {
+        throw new BadRequest(`env key not allowed: ${key} (only CHANNEL_* is forwarded)`)
+      }
     }
     const spec = RUNTIMES[kind]
     const proc = pty.spawn(spec.command, [...spec.baseArgs, ...args], {
@@ -49,7 +64,7 @@ export class Supervisor {
       cols: this.defaults.cols ?? 200,
       rows: this.defaults.rows ?? 50,
       cwd: this.defaults.cwd,
-      env: process.env as Record<string, string>,
+      env: { ...(process.env as Record<string, string>), ...env },
     })
 
     const session: LiveSession = {
@@ -63,7 +78,19 @@ export class Supervisor {
 
     // The conversation flows through the channel, NOT the PTY (ADR 0004). We drain
     // the PTY so its buffer never backs up, but we do not interpret the output.
-    proc.onData(() => {})
+    // With ptyLogDir set, the drain also tees to a per-session file (debug aid).
+    if (this.defaults.ptyLogDir) {
+      const logPath = join(this.defaults.ptyLogDir, `${id}.pty.log`)
+      proc.onData((data) => {
+        try {
+          appendFileSync(logPath, data)
+        } catch {
+          /* logging must never break the session */
+        }
+      })
+    } else {
+      proc.onData(() => {})
+    }
     proc.onExit(({ exitCode }) => {
       session.status = 'exited'
       session.exitCode = exitCode
