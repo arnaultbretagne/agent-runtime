@@ -1,4 +1,5 @@
 {
+  "autoUpdates": false,
   "channelsEnabled": true,
   "allowedChannelPlugins": [
     { "marketplace": "agora", "plugin": "agora" }
