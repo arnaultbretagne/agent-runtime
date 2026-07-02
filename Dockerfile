@@ -20,6 +20,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       tini git curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# managed-settings: org policy that APPROVES the agora channel plugin for a subscription
+# session (spike FINDINGS §5 — without this, claude refuses the channel: "not on the approved
+# channels allowlist"). Non-secret policy → baked in the image (read by claude at /etc/claude-code).
+COPY image/managed-settings.json /etc/claude-code/managed-settings.json
+
 # use the image's existing non-root `node` user (uid 1000 — skip-permissions needs non-root,
 # ADR 0003/0004); give it /app
 RUN mkdir -p /app && chown node:node /app
