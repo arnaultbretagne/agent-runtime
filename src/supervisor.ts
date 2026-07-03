@@ -6,6 +6,17 @@ import { RUNTIMES, KNOWN_KINDS, isKnownKind } from './runtimes.js'
 /** Thrown for caller errors → mapped to HTTP 400. */
 export class BadRequest extends Error {}
 
+/**
+ * How long a *crashed* session lingers in the registry as `exited` before it is
+ * GC'd (ADR 0009). It must comfortably exceed the hub's reconcile interval (~2–5 s)
+ * so the hub reads the `exitCode` (→ `error`) before the record vanishes. Voluntary
+ * kills do not use this — `kill()` forgets them immediately (→ 404 → `dormant`).
+ */
+const EXITED_TTL_MS = 60_000
+
+/** How often the supervisor scans for idle sessions to reap (ADR 0008). */
+const SWEEP_INTERVAL_MS = Number(process.env.SWEEP_INTERVAL_MS ?? 30_000)
+
 export interface SessionInfo {
   id: string
   kind: string
@@ -17,6 +28,10 @@ export interface SessionInfo {
 
 interface LiveSession extends SessionInfo {
   proc: pty.IPty
+  /** Last activity heartbeat (ms). Initialised at spawn; bumped by touch() (ADR 0008). */
+  lastTouch: number
+  /** Idle window (ms) past which this session is reaped; undefined = never idle-reaped. */
+  idleTtlMs?: number
 }
 
 export interface SpawnDefaults {
@@ -37,7 +52,10 @@ export interface SpawnDefaults {
 export class Supervisor {
   private readonly sessions = new Map<string, LiveSession>()
 
-  constructor(private readonly defaults: SpawnDefaults) {}
+  constructor(private readonly defaults: SpawnDefaults) {
+    // The supervisor owns idle-reaping (ADR 0008): a single sweep over all sessions.
+    setInterval(() => this.reapIdle(), SWEEP_INTERVAL_MS).unref()
+  }
 
   /**
    * Spawn a runtime of `kind` under a PTY, forwarding `args` as argv and `env`
@@ -46,7 +64,13 @@ export class Supervisor {
    * conversation id, token), and the prefix closes the env-injection vector
    * (PATH, LD_*, NODE_OPTIONS…) the same way `kind` closes arbitrary exec.
    */
-  spawn(kind: string, id: string, args: string[], env: Record<string, string> = {}): SessionInfo {
+  spawn(
+    kind: string,
+    id: string,
+    args: string[],
+    env: Record<string, string> = {},
+    idleTtlMs?: number,
+  ): SessionInfo {
     if (!isKnownKind(kind)) {
       throw new BadRequest(`unknown kind: ${kind} (known: ${KNOWN_KINDS.join(', ')})`)
     }
@@ -74,6 +98,8 @@ export class Supervisor {
       status: 'running',
       startedAt: new Date().toISOString(),
       proc,
+      lastTouch: Date.now(), // spawn = t0; a runtime is only ever spawned to process a pending message
+      idleTtlMs,
     }
 
     // The conversation flows through the channel, NOT the PTY (ADR 0004). We drain
@@ -92,8 +118,14 @@ export class Supervisor {
       proc.onData(() => {})
     }
     proc.onExit(({ exitCode }) => {
+      // An exit we did NOT ask for = a crash. Keep the record (with its exitCode) so the
+      // hub's reconcile reads it as `error`, then GC it (ADR 0009). A *voluntary* kill has
+      // already removed the session in kill(), so this only ever fires for a real crash.
       session.status = 'exited'
       session.exitCode = exitCode
+      setTimeout(() => {
+        if (this.sessions.get(id) === session) this.sessions.delete(id)
+      }, EXITED_TTL_MS).unref?.()
     })
 
     this.sessions.set(id, session)
@@ -121,9 +153,53 @@ export class Supervisor {
     this.sessions.delete(id)
     return true
   }
+
+  /**
+   * Heartbeat: mark a session active *now* (ADR 0008). The caller (hub) touches on each
+   * completed turn; the supervisor attaches no meaning to it beyond "still active".
+   * Returns false if the id is unknown.
+   */
+  touch(id: string): boolean {
+    const s = this.sessions.get(id)
+    if (!s) return false
+    s.lastTouch = Date.now()
+    return true
+  }
+
+  /**
+   * Reap sessions idle past their `idleTtlMs` (ADR 0008): once the harness cache lapses,
+   * keeping the runtime alive is wasteful (its next turn is a cold reprocess either way).
+   * A reap goes through kill() → the entry is forgotten → the hub reads 404 → `dormant`.
+   * Sessions without an `idleTtlMs` are never idle-reaped.
+   */
+  reapIdle(): void {
+    const now = Date.now()
+    for (const [id, s] of [...this.sessions]) {
+      if (s.status !== 'running' || s.idleTtlMs === undefined) continue
+      const idle = now - s.lastTouch
+      if (idle < s.idleTtlMs) continue
+      console.log(`[supervisor] reaping idle session ${id}: ${Math.round(idle / 1000)}s ≥ ${Math.round(s.idleTtlMs / 1000)}s TTL`)
+      this.kill(id)
+    }
+  }
+
+  /**
+   * SIGTERM every tracked session and forget them — used by the shutdown handler
+   * (ADR 0009: a stopping supervisor must not leak its children as orphans). Returns
+   * the signalled pids so the caller can SIGKILL any straggler after a grace period.
+   */
+  killAll(): number[] {
+    const pids: number[] = []
+    for (const id of [...this.sessions.keys()]) {
+      const s = this.sessions.get(id)
+      if (s) pids.push(s.pid)
+      this.kill(id)
+    }
+    return pids
+  }
 }
 
 function strip(s: LiveSession): SessionInfo {
-  const { proc: _proc, ...info } = s
+  const { proc: _proc, lastTouch: _lastTouch, idleTtlMs: _idleTtlMs, ...info } = s
   return info
 }

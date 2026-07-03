@@ -1,17 +1,19 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { randomUUID } from 'node:crypto'
+import { readdirSync, readFileSync } from 'node:fs'
 import { Supervisor, BadRequest } from './supervisor.js'
-import { KNOWN_KINDS } from './runtimes.js'
+import { KNOWN_KINDS, RUNTIMES } from './runtimes.js'
 
 /**
  * Supervisor control API (ADR 0001/0002). The ONLY inbound surface, reachable
  * in-cluster from the website only (ADR 0003 ingress). It is NOT an exec channel:
  * it accepts a closed `kind` + a forwarded argv list (no shell), never a raw command.
  *
- *   POST   /sessions   { kind, id?, args?, env? }  → spawn, returns the session
- *                        (env: CHANNEL_*-prefixed pipe config only)
+ *   POST   /sessions   { kind, id?, args?, env?, idleTtlMs? }  → spawn, returns the session
+ *                        (env: CHANNEL_*-prefixed pipe config only; idleTtlMs: opaque reap window)
  *   GET    /sessions                                → list
  *   GET    /sessions/:id                            → status
+ *   POST   /sessions/:id/touch                      → heartbeat (reset the idle clock)
  *   DELETE /sessions/:id                            → kill / reap
  *   GET    /kinds                                   → the baked runtime registry
  *   GET    /healthz
@@ -40,9 +42,21 @@ const server = createServer(async (req, res) => {
         const id = typeof body.id === 'string' && body.id ? body.id : randomUUID()
         const args = Array.isArray(body.args) ? body.args.map(String) : []
         const env = envParam(body.env)
-        return send(res, 201, sup.spawn(body.kind, id, args, env))
+        // Opaque idle window (ADR 0008): reap the session after this much inactivity. The
+        // supervisor does not interpret it (the hub knows it is the harness cache TTL).
+        const idleTtlMs =
+          typeof body.idleTtlMs === 'number' && body.idleTtlMs > 0 ? body.idleTtlMs : undefined
+        return send(res, 201, sup.spawn(body.kind, id, args, env, idleTtlMs))
       }
       return send(res, 405, { error: 'method not allowed' })
+    }
+
+    const touchMatch = path.match(/^\/sessions\/([^/]+)\/touch$/)
+    if (touchMatch) {
+      if (method !== 'POST') return send(res, 405, { error: 'method not allowed' })
+      const id = decodeURIComponent(touchMatch[1])
+      const ok = sup.touch(id)
+      return send(res, ok ? 200 : 404, { id, touched: ok })
     }
 
     const match = path.match(/^\/sessions\/([^/]+)$/)
@@ -65,6 +79,66 @@ const server = createServer(async (req, res) => {
     return send(res, 500, { error: (err as Error).message })
   }
 })
+
+/**
+ * Clean-slate invariant (ADR 0009): a freshly started supervisor owns NOTHING it did
+ * not spawn. Any runtime-shaped process alive in our PID namespace is an orphan from a
+ * previous incarnation (e.g. a crash that skipped kill-on-shutdown) → SIGKILL it. Runs
+ * BEFORE listen(), so no legitimate session can exist yet. Matches by the runtimes'
+ * OWN commands (baked registry) — never by `--channels` or any product marker (ADR 0002).
+ */
+function bootSweepStrays(): void {
+  const commands = new Set(KNOWN_KINDS.map((k) => RUNTIMES[k].command))
+  let pids: string[]
+  try {
+    pids = readdirSync('/proc').filter((p) => /^\d+$/.test(p))
+  } catch {
+    return // not Linux / no /proc — nothing to sweep
+  }
+  let killed = 0
+  for (const pid of pids) {
+    if (Number(pid) === process.pid) continue
+    let argv0: string
+    try {
+      argv0 = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0')[0]
+    } catch {
+      continue // process vanished or unreadable
+    }
+    if (!argv0) continue
+    const base = argv0.split('/').pop() ?? argv0
+    if (!commands.has(base)) continue
+    try {
+      process.kill(Number(pid), 'SIGKILL')
+      killed++
+    } catch {
+      /* already gone */
+    }
+  }
+  if (killed) console.log(`[supervisor] boot-sweep: killed ${killed} orphan runtime process(es)`)
+}
+
+// Kill-on-shutdown (ADR 0009): SIGTERM every child, give a short grace, SIGKILL the
+// stragglers, then exit — so `run.sh stop` / pod termination leaves no orphans.
+let shuttingDown = false
+function shutdown(sig: string): void {
+  if (shuttingDown) return
+  shuttingDown = true
+  const pids = sup.killAll()
+  console.log(`[supervisor] ${sig} → terminated ${pids.length} session(s), exiting`)
+  setTimeout(() => {
+    for (const pid of pids) {
+      try {
+        process.kill(pid, 'SIGKILL')
+      } catch {
+        /* already dead */
+      }
+    }
+    process.exit(0)
+  }, 2000).unref?.()
+}
+for (const sig of ['SIGTERM', 'SIGINT'] as const) process.on(sig, () => shutdown(sig))
+
+bootSweepStrays()
 
 server.listen(PORT, HOST, () => {
   console.log(`[supervisor] listening on ${HOST}:${PORT} — runtime cwd: ${RUNTIME_CWD}`)
