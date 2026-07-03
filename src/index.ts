@@ -2,7 +2,8 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { randomUUID } from 'node:crypto'
 import { readdirSync, readFileSync } from 'node:fs'
 import { Supervisor, BadRequest } from './supervisor.js'
-import { KNOWN_KINDS, RUNTIMES } from './runtimes.js'
+import { KNOWN_KINDS, RUNTIMES, isKnownKind } from './runtimes.js'
+import { getCapabilities } from './capabilities.js'
 
 /**
  * Supervisor control API (ADR 0001/0002). The ONLY inbound surface, reachable
@@ -16,6 +17,7 @@ import { KNOWN_KINDS, RUNTIMES } from './runtimes.js'
  *   POST   /sessions/:id/touch                      → heartbeat (reset the idle clock)
  *   DELETE /sessions/:id                            → kill / reap
  *   GET    /kinds                                   → the baked runtime registry
+ *   GET    /kinds/:kind/capabilities                → discovered models / efforts / agents
  *   GET    /healthz
  */
 const PORT = Number(process.env.PORT ?? 8080)
@@ -33,6 +35,13 @@ const server = createServer(async (req, res) => {
 
     if (path === '/healthz') return send(res, 200, { ok: true })
     if (path === '/kinds' && method === 'GET') return send(res, 200, { kinds: KNOWN_KINDS })
+
+    const capsMatch = path.match(/^\/kinds\/([^/]+)\/capabilities$/)
+    if (capsMatch && method === 'GET') {
+      const kind = decodeURIComponent(capsMatch[1])
+      if (!isKnownKind(kind)) return send(res, 404, { error: `unknown kind: ${kind}` })
+      return send(res, 200, await getCapabilities(kind))
+    }
 
     if (path === '/sessions') {
       if (method === 'GET') return send(res, 200, { sessions: sup.list() })
@@ -142,6 +151,12 @@ bootSweepStrays()
 
 server.listen(PORT, HOST, () => {
   console.log(`[supervisor] listening on ${HOST}:${PORT} — runtime cwd: ${RUNTIME_CWD}`)
+  // warm the capability cache so the first UI request is fast (best-effort)
+  for (const k of KNOWN_KINDS) {
+    getCapabilities(k)
+      .then((c) => console.log(`[caps] ${k}: ${c.models.length} models, ${c.agents.length} agents`))
+      .catch((e) => console.log(`[caps] warm ${k} failed: ${e.message}`))
+  }
 })
 
 function send(res: ServerResponse, code: number, body: unknown): void {
