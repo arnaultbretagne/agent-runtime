@@ -100,10 +100,13 @@ export class Supervisor {
       env: { ...(process.env as Record<string, string>), ...env },
     })
 
-    // The caller forwards `--session-id <uuid>` (agora spawnSpec); remember it so we can locate this
-    // runtime's native transcript and report the concrete model it resolved to.
+    // The caller forwards `--session-id <uuid>` on a fresh spawn, or `--resume <uuid>` on a
+    // resumed one (agora spawnSpec, ADR 0007) — either names the same native transcript file, so
+    // remember whichever is present to locate it and report the concrete model resolved.
+    // `--session-id` wins if somehow both are present.
     const sidIdx = args.indexOf('--session-id')
-    const sessionUuid = sidIdx >= 0 ? args[sidIdx + 1] : undefined
+    const resumeIdx = args.indexOf('--resume')
+    const sessionUuid = sidIdx >= 0 ? args[sidIdx + 1] : (resumeIdx >= 0 ? args[resumeIdx + 1] : undefined)
 
     const session: LiveSession = {
       id,
