@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, readFileSync, readdirSync } from 'node:fs'
+import { appendFileSync, existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import * as pty from 'node-pty'
 import { RUNTIMES, KNOWN_KINDS, isKnownKind } from './runtimes.js'
@@ -37,7 +37,13 @@ interface LiveSession extends SessionInfo {
   idleTtlMs?: number
   /** The `--session-id` UUID forwarded at spawn → locates the native transcript on the PVC. */
   sessionUuid?: string
-  /** Concrete model once read from the transcript; cached (stable for the session's life). */
+  /** Transcript size (bytes) at spawn. A `--resume`d transcript PRE-EXISTS with a previous
+   *  runtime's turns — possibly another model's (agora kills + resumes on a model patch) — so
+   *  the model report must only ever read lines written past this offset, i.e. by THIS session.
+   *  0 for a fresh spawn (file not created yet). */
+  transcriptBase: number
+  /** Concrete model once read from the transcript; cached (stable for the session's life,
+   *  guaranteed by `transcriptBase`: only this session's own lines are ever considered). */
   resolvedModel?: string
 }
 
@@ -91,6 +97,18 @@ export class Supervisor {
         throw new BadRequest(`env key not allowed: ${key} (only CHANNEL_* is forwarded)`)
       }
     }
+    // The caller forwards `--session-id <uuid>` on a fresh spawn, or `--resume <uuid>` on a
+    // resumed one (agora spawnSpec, ADR 0007) — either names the same native transcript file, so
+    // remember whichever is present to locate it and report the concrete model resolved.
+    // `--session-id` wins if somehow both are present.
+    const sidIdx = args.indexOf('--session-id')
+    const resumeIdx = args.indexOf('--resume')
+    const sessionUuid = sidIdx >= 0 ? args[sidIdx + 1] : (resumeIdx >= 0 ? args[resumeIdx + 1] : undefined)
+    // Snapshot the transcript size BEFORE the child exists: on `--resume` the file pre-exists
+    // with the previous runtime's turns, and the model report must never read those (the whole
+    // point of a model patch is that this session runs a DIFFERENT model than its history).
+    const transcriptBase = sessionUuid ? this.transcriptSize(sessionUuid) : 0
+
     const spec = RUNTIMES[kind]
     const proc = pty.spawn(spec.command, [...spec.baseArgs, ...args], {
       name: 'xterm-256color',
@@ -99,14 +117,6 @@ export class Supervisor {
       cwd: this.defaults.cwd,
       env: { ...(process.env as Record<string, string>), ...env },
     })
-
-    // The caller forwards `--session-id <uuid>` on a fresh spawn, or `--resume <uuid>` on a
-    // resumed one (agora spawnSpec, ADR 0007) — either names the same native transcript file, so
-    // remember whichever is present to locate it and report the concrete model resolved.
-    // `--session-id` wins if somehow both are present.
-    const sidIdx = args.indexOf('--session-id')
-    const resumeIdx = args.indexOf('--resume')
-    const sessionUuid = sidIdx >= 0 ? args[sidIdx + 1] : (resumeIdx >= 0 ? args[resumeIdx + 1] : undefined)
 
     const session: LiveSession = {
       id,
@@ -118,6 +128,7 @@ export class Supervisor {
       lastTouch: Date.now(), // spawn = t0; a runtime is only ever spawned to process a pending message
       idleTtlMs,
       sessionUuid,
+      transcriptBase,
     }
 
     // The conversation flows through the channel, NOT the PTY (ADR 0004). We drain
@@ -172,18 +183,13 @@ export class Supervisor {
    */
   private resolveModel(s: LiveSession): void {
     if (s.resolvedModel || !s.sessionUuid) return
-    let file: string | undefined
-    try {
-      for (const slug of readdirSync(this.projectsDir)) {
-        const p = join(this.projectsDir, slug, `${s.sessionUuid}.jsonl`)
-        if (existsSync(p)) { file = p; break }
-      }
-    } catch {
-      return // projects dir not created yet
-    }
+    const file = this.locateTranscript(s.sessionUuid)
     if (!file) return
     try {
-      const lines = readFileSync(file, 'utf8').split('\n')
+      // Only what THIS session wrote (past the spawn-time offset): a resumed transcript starts
+      // with a previous runtime's turns, possibly another model's. Nothing written yet → no
+      // model reported yet → retried on the next poll (nothing gets cached prematurely).
+      const lines = readFileSync(file).subarray(s.transcriptBase).toString('utf8').split('\n')
       for (let i = lines.length - 1; i >= 0; i--) {
         const line = lines[i].trim()
         if (!line) continue
@@ -201,6 +207,30 @@ export class Supervisor {
       }
     } catch {
       /* transcript vanished / mid-write — retry on the next poll */
+    }
+  }
+
+  /** Locate a native transcript by its uuid across the project slug dirs (cwd-dependent). */
+  private locateTranscript(sessionUuid: string): string | undefined {
+    try {
+      for (const slug of readdirSync(this.projectsDir)) {
+        const p = join(this.projectsDir, slug, `${sessionUuid}.jsonl`)
+        if (existsSync(p)) return p
+      }
+    } catch {
+      /* projects dir not created yet */
+    }
+    return undefined
+  }
+
+  /** Transcript size (bytes) right now — the spawn-time baseline for `transcriptBase`. */
+  private transcriptSize(sessionUuid: string): number {
+    const file = this.locateTranscript(sessionUuid)
+    if (!file) return 0
+    try {
+      return statSync(file).size
+    } catch {
+      return 0
     }
   }
 
