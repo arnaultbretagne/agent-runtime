@@ -87,7 +87,14 @@ async function claudeCapabilities(): Promise<KindCapabilities> {
   } catch (err) {
     console.log(`[caps] model discovery failed: ${(err as Error).message}`)
   }
-  return { models, agents: claudeAgents(), defaults: { model: 'default' } }
+  // Defaults are DERIVED, not a synthetic "default" placeholder: the product preselects a real model
+  // (so the picker never shows a meaningless "Défaut"). claude's own no-`--model` default is the latest
+  // Sonnet, so we mirror that (`/sonnet/`, newest-first in the catalogue) and fall back to the first
+  // catalogue entry. Default effort = the highest-signal level the default model actually supports.
+  const defaultModel = models.find((m) => /sonnet/i.test(m.id))?.id ?? models[0]?.id ?? ''
+  const dm = models.find((m) => m.id === defaultModel)
+  const defaultEffort = ['high', 'medium', 'low', 'xhigh', 'max'].find((e) => dm?.efforts.includes(e))
+  return { models, agents: claudeAgents(), defaults: { model: defaultModel, effort: defaultEffort } }
 }
 
 const PROBES: Record<string, () => Promise<KindCapabilities>> = {
