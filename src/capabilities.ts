@@ -5,20 +5,22 @@
  * how to introspect itself. Adding a runtime kind = adding its probe here.
  *
  * For `claude` nothing is hardcoded that the harness can tell us itself:
- *   - models  → GET /v1/models (the subscription OAuth token lists the account's catalogue;
- *               a new model release appears on its own — no curated list to maintain)
- *   - efforts → read PER MODEL from each model's `capabilities.effort` (the API reports
- *               exactly which levels that model supports)
+ *   - models  → the aliases the harness's OWN `/model` picker exposes, read straight out of the
+ *               co-located claude binary. NOT the API `/v1/models` catalogue: that is a different,
+ *               longer set the CLI does not honor (passing an API id like `claude-opus-4-1` silently
+ *               resolves to the `opus` alias' current target — so it must never drive the picker).
+ *   - efforts → the `--effort` scale (low…max); every current tier supports the full set.
  *   - agents  → scan the `.claude/agents/*.md` definitions (project + user), `name:` frontmatter
  */
 import { readdirSync, readFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
 import { join } from 'node:path'
 
 export interface ModelInfo {
-  id: string
-  name: string
-  created?: string
-  /** Effort levels this specific model supports (subset of low/medium/high/xhigh/max). */
+  id: string // the `--model` alias (sonnet/opus/haiku/fable/opusplan) — what the harness resolves
+  name: string // the picker label (Sonnet, Opus, …)
+  description?: string // the picker's one-line description
+  /** Effort levels this model supports (subset of low/medium/high/xhigh/max). */
   efforts: string[]
 }
 
@@ -30,26 +32,45 @@ export interface KindCapabilities {
 
 const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max']
 
-async function claudeModels(): Promise<ModelInfo[]> {
-  const token = process.env.CLAUDE_CODE_OAUTH_TOKEN
-  if (!token) {
-    console.log('[caps] no CLAUDE_CODE_OAUTH_TOKEN → empty model catalogue')
-    return []
+// The model-TIER aliases the harness's `/model` picker offers. We read each row's label/description/
+// presence from the binary, but filter to these known tiers so we skip the OTHER {value,label,
+// description} pickers baked in the same binary (thinking on/off, subagent "inherit", PR-monitor
+// "continue", …). `best`/others only appear if the binary actually ships a row for them.
+const MODEL_ALIASES = ['sonnet', 'opus', 'haiku', 'fable', 'opusplan', 'best']
+
+/** The harness's REAL model list = the aliases its own `/model` picker exposes, parsed straight out
+ *  of the co-located claude binary (each row is a literal `{value:"…",label:"…",description:"…"}`).
+ *  So the list is exactly THIS harness version's, updates when the binary does (e.g. `fable` appeared
+ *  as a new row at its launch), and each alias resolves to the provider's current recommended version
+ *  at spawn — a new *version* needs zero changes here. We grep the binary (≈245 MB) in a child rather
+ *  than load it into the heap; misses (grep exit 1) and resolution failures yield an empty list. */
+function claudeModels(): ModelInfo[] {
+  let bin = ''
+  try {
+    bin = execFileSync('sh', ['-c', 'readlink -f "$(command -v claude)"']).toString().trim()
+  } catch {
+    /* claude not on PATH */
   }
-  const res = await fetch('https://api.anthropic.com/v1/models?limit=100', {
-    headers: { authorization: `Bearer ${token}`, 'anthropic-version': '2023-06-01' },
-  })
-  if (!res.ok) throw new Error(`GET /v1/models → ${res.status}`)
-  const data = (await res.json()) as { data?: any[] }
-  return (data.data ?? []).map((m) => {
-    const eff = m.capabilities?.effort
-    return {
-      id: m.id,
-      name: m.display_name ?? m.id,
-      created: m.created_at,
-      efforts: eff?.supported ? EFFORT_LEVELS.filter((lvl) => eff[lvl]?.supported) : [],
-    }
-  })
+  if (!bin) return []
+  let out = ''
+  try {
+    out = execFileSync(
+      'grep',
+      ['-aoE', '\\{value:"[a-z]+",label:"[^"]+",description:"[^"]+"\\}', bin],
+      { maxBuffer: 16 * 1024 * 1024 },
+    ).toString()
+  } catch {
+    return [] // grep exits non-zero when nothing matches (or is absent)
+  }
+  const seen = new Map<string, ModelInfo>()
+  const re = /\{value:"([a-z]+)",label:"([^"]+)",description:"([^"]+)"\}/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(out))) {
+    const [, id, name, description] = m
+    if (!MODEL_ALIASES.includes(id) || seen.has(id)) continue
+    seen.set(id, { id, name, description, efforts: [...EFFORT_LEVELS] })
+  }
+  return [...seen.values()].sort((a, b) => MODEL_ALIASES.indexOf(a.id) - MODEL_ALIASES.indexOf(b.id))
 }
 
 /** Custom agent DEFINITIONS visible to the runtime (project + user). Built-in Claude Code
@@ -81,19 +102,11 @@ function claudeAgents(): string[] {
 }
 
 async function claudeCapabilities(): Promise<KindCapabilities> {
-  let models: ModelInfo[] = []
-  try {
-    models = await claudeModels()
-  } catch (err) {
-    console.log(`[caps] model discovery failed: ${(err as Error).message}`)
-  }
-  // Defaults are DERIVED, not a synthetic "default" placeholder: the product preselects a real model
-  // (so the picker never shows a meaningless "Défaut"). claude's own no-`--model` default is the latest
-  // Sonnet, so we mirror that (`/sonnet/`, newest-first in the catalogue) and fall back to the first
-  // catalogue entry. Default effort = the highest-signal level the default model actually supports.
-  const defaultModel = models.find((m) => /sonnet/i.test(m.id))?.id ?? models[0]?.id ?? ''
-  const dm = models.find((m) => m.id === defaultModel)
-  const defaultEffort = ['high', 'medium', 'low', 'xhigh', 'max'].find((e) => dm?.efforts.includes(e))
+  const models = claudeModels()
+  // Preselect a real tier (never a synthetic "Défaut"): claude's own no-`--model` default is the
+  // recommended Sonnet, so mirror that with the `sonnet` alias when present, else the first tier.
+  const defaultModel = models.find((m) => m.id === 'sonnet')?.id ?? models[0]?.id ?? ''
+  const defaultEffort = models.find((m) => m.id === defaultModel)?.efforts.includes('high') ? 'high' : undefined
   return { models, agents: claudeAgents(), defaults: { model: defaultModel, effort: defaultEffort } }
 }
 
@@ -104,8 +117,8 @@ const PROBES: Record<string, () => Promise<KindCapabilities>> = {
 const CACHE_TTL_MS = Number(process.env.CAPS_TTL_MS ?? 600_000)
 const cache = new Map<string, { at: number; data: KindCapabilities }>()
 
-/** Cached per-kind capability descriptor. Models change rarely, and the probe hits the
- *  network, so we cache for CAPS_TTL_MS (10 min default) and refresh lazily. */
+/** Cached per-kind capability descriptor. The probe greps a ~245 MB binary + scans dirs, and the
+ *  answer only changes on a claude upgrade, so we cache for CAPS_TTL_MS (10 min) and refresh lazily. */
 export async function getCapabilities(kind: string): Promise<KindCapabilities> {
   const probe = PROBES[kind]
   if (!probe) throw new Error(`no capability probe for kind: ${kind}`)
