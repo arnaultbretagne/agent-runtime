@@ -1,4 +1,4 @@
-import { appendFileSync } from 'node:fs'
+import { appendFileSync, existsSync, readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import * as pty from 'node-pty'
 import { RUNTIMES, KNOWN_KINDS, isKnownKind } from './runtimes.js'
@@ -24,6 +24,9 @@ export interface SessionInfo {
   status: 'running' | 'exited'
   startedAt: string
   exitCode?: number
+  /** Concrete model the runtime resolved its `--model <alias>` to (e.g. `sonnet` → `claude-sonnet-5`),
+   *  read from the native transcript. Absent until the runtime's first turn is written. */
+  model?: string
 }
 
 interface LiveSession extends SessionInfo {
@@ -32,6 +35,10 @@ interface LiveSession extends SessionInfo {
   lastTouch: number
   /** Idle window (ms) past which this session is reaped; undefined = never idle-reaped. */
   idleTtlMs?: number
+  /** The `--session-id` UUID forwarded at spawn → locates the native transcript on the PVC. */
+  sessionUuid?: string
+  /** Concrete model once read from the transcript; cached (stable for the session's life). */
+  resolvedModel?: string
 }
 
 export interface SpawnDefaults {
@@ -51,6 +58,8 @@ export interface SpawnDefaults {
  */
 export class Supervisor {
   private readonly sessions = new Map<string, LiveSession>()
+  /** Where claude writes native transcripts: `<HOME>/.claude/projects/<cwd-slug>/<session-id>.jsonl`. */
+  private readonly projectsDir = join(process.env.HOME ?? '', '.claude', 'projects')
 
   constructor(private readonly defaults: SpawnDefaults) {
     // The supervisor owns idle-reaping (ADR 0008): a single sweep over all sessions.
@@ -91,6 +100,11 @@ export class Supervisor {
       env: { ...(process.env as Record<string, string>), ...env },
     })
 
+    // The caller forwards `--session-id <uuid>` (agora spawnSpec); remember it so we can locate this
+    // runtime's native transcript and report the concrete model it resolved to.
+    const sidIdx = args.indexOf('--session-id')
+    const sessionUuid = sidIdx >= 0 ? args[sidIdx + 1] : undefined
+
     const session: LiveSession = {
       id,
       kind,
@@ -100,6 +114,7 @@ export class Supervisor {
       proc,
       lastTouch: Date.now(), // spawn = t0; a runtime is only ever spawned to process a pending message
       idleTtlMs,
+      sessionUuid,
     }
 
     // The conversation flows through the channel, NOT the PTY (ADR 0004). We drain
@@ -133,12 +148,57 @@ export class Supervisor {
   }
 
   list(): SessionInfo[] {
-    return [...this.sessions.values()].map(strip)
+    return [...this.sessions.values()].map((s) => {
+      if (s.status === 'running') this.resolveModel(s)
+      return strip(s)
+    })
   }
 
   get(id: string): SessionInfo | undefined {
     const s = this.sessions.get(id)
-    return s ? strip(s) : undefined
+    if (!s) return undefined
+    if (s.status === 'running') this.resolveModel(s)
+    return strip(s)
+  }
+
+  /**
+   * Read the CONCRETE model the runtime resolved (`--model sonnet` → `claude-sonnet-5`) from its
+   * native transcript — the audit truth the caller stores against the conversation. Only the latest
+   * assistant turn is needed; once found it is cached, so this is a cheap no-op thereafter. The
+   * transcript file is named by the `--session-id` UUID; we glob the project slug dirs to find it.
+   */
+  private resolveModel(s: LiveSession): void {
+    if (s.resolvedModel || !s.sessionUuid) return
+    let file: string | undefined
+    try {
+      for (const slug of readdirSync(this.projectsDir)) {
+        const p = join(this.projectsDir, slug, `${s.sessionUuid}.jsonl`)
+        if (existsSync(p)) { file = p; break }
+      }
+    } catch {
+      return // projects dir not created yet
+    }
+    if (!file) return
+    try {
+      const lines = readFileSync(file, 'utf8').split('\n')
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i].trim()
+        if (!line) continue
+        let obj: { model?: string; message?: { model?: string } }
+        try {
+          obj = JSON.parse(line)
+        } catch {
+          continue // partial last line mid-write
+        }
+        const model = obj.message?.model ?? obj.model
+        if (typeof model === 'string' && model.startsWith('claude-')) {
+          s.resolvedModel = model
+          return
+        }
+      }
+    } catch {
+      /* transcript vanished / mid-write — retry on the next poll */
+    }
   }
 
   /** Kill and forget a session. Returns false if the id is unknown. */
@@ -200,6 +260,7 @@ export class Supervisor {
 }
 
 function strip(s: LiveSession): SessionInfo {
-  const { proc: _proc, lastTouch: _lastTouch, idleTtlMs: _idleTtlMs, ...info } = s
-  return info
+  const { proc: _proc, lastTouch: _lastTouch, idleTtlMs: _idleTtlMs,
+    sessionUuid: _sessionUuid, resolvedModel, ...info } = s
+  return { ...info, model: resolvedModel }
 }
