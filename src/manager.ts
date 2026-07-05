@@ -60,11 +60,15 @@ export function buildLogePodSpec(group: string, config: ManagerConfig): Record<s
       restartPolicy: 'Never',
       runtimeClassName: 'sandboxed',
       automountServiceAccountToken: false,
-      // runAsNonRoot at pod level so it covers every container uniformly (PSA `restricted`
-      // requires it explicitly true somewhere for EACH container — a real rejection hit live
-      // 2026-07-05: the initContainers didn't set it and agent-runs enforces restricted from
-      // birth, unlike the Phase V verrou namespace which was deliberately unlabelled).
-      securityContext: { fsGroup: 1000, seccompProfile: { type: 'RuntimeDefault' }, runAsNonRoot: true },
+      // runAsNonRoot + runAsUser at pod level so they cover every container uniformly. Two-stage
+      // bug hit live 2026-07-05 (P4.1): (1) PSA `restricted` admission only checks the field is
+      // SET on every container (agent-runs enforces it from birth, unlike the unlabelled Phase V
+      // verrou namespace) — passing runAsNonRoot alone got the pod admitted; (2) but both images
+      // declare their non-root user by NAME (`USER node` in both Dockerfiles), and kubelet's
+      // startup-time check refuses to trust a named user as non-root — it needs a numeric uid.
+      // 1000 is that user in both images (agent-runtime and agora-website both build on
+      // node:20-bookworm-slim; agent-runtime's Dockerfile documents it explicitly).
+      securityContext: { fsGroup: 1000, seccompProfile: { type: 'RuntimeDefault' }, runAsNonRoot: true, runAsUser: 1000 },
       initContainers: [
         {
           name: 'fetch-channel',
