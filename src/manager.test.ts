@@ -135,6 +135,16 @@ test('spawn: shared substrate proxies verbatim, stripping substrate/group', asyn
   }
 })
 
+test('spawn: shared proxy unreachable -> honest 502, never a fabricated quota_exceeded', async () => {
+  // Incident 2026-07-05: a CNP gap made this fetch throw, and the old code mapped ANY forwardSpawn
+  // exception to quota_exceeded — indistinguishable from a real loge-creation quota problem.
+  const k8s = new MockK8s((name) => readyLoge(name, 'unused', '127.0.0.1'))
+  const manager = new Manager({ k8s, config: baseConfig({ sharedSupervisorUrl: 'http://127.0.0.1:1' }) })
+  const result = await manager.spawn({ kind: 'claude', args: [], substrate: 'shared' })
+  assert.equal(result.status, 502)
+  assert.equal((result.body as { error: string }).error, 'spawn_forward_failed')
+})
+
 test('spawn: isolated substrate creates a loge once, reuses it for the same group', async () => {
   const ip = allocLoopback()
   const loge = await startFakeServer((method, path) => {

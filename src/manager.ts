@@ -434,6 +434,12 @@ export class Manager {
     }
   }
 
+  /**
+   * Incident 2026-07-05: this used to catch-all into a fake `503 quota_exceeded`, which masked a
+   * CNP gap (the shared supervisor's ingress didn't yet allow the manager) as if it were a loge
+   * quota problem. `quota_exceeded` means specifically "couldn't create/ready a loge pod"
+   * (getOrCreateLoge) — a forwarding failure here is a distinct, honest 502.
+   */
   private async forwardSpawn(baseUrl: string, payload: Record<string, unknown>): Promise<{ status: number; body: unknown }> {
     try {
       const res = await fetch(`${baseUrl}/sessions`, {
@@ -444,7 +450,7 @@ export class Manager {
       const body = await res.json().catch(() => undefined)
       return { status: res.status, body }
     } catch (err) {
-      return { status: 503, body: { error: 'quota_exceeded' } }
+      return { status: 502, body: { error: 'spawn_forward_failed', detail: (err as Error).message } }
     }
   }
 
