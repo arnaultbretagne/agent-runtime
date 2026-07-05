@@ -73,3 +73,7 @@ state composition) — the supervisor emits no product event, it just ends a pro
   restart — is a **bug to remove, not a state to reconstruct**: on shutdown the supervisor kills its
   children, and on boot it sweeps strays to a clean slate (specified in **ADR 0009**). So the
   supervisor never re-adopts a live session and `lastTouch` never needs seeding from anything but a spawn.
+
+**Amendment 2026-07-05 (ADR 0010 — substrates).** Unchanged inside a loge (the idle clock still
+lives with the session). The *pod-level* linger-then-drain window after the last session ends is
+the manager's, not the supervisor's — see ADR 0010 §5.

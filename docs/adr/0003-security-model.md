@@ -80,3 +80,8 @@ ingress rule above.
 - **Decided**: **skip-permissions is the default** (above); the mode becomes a per-conversation
   parameter from agora, with **relay** as the opt-in (more "human-in-the-loop"; fakechat doesn't
   support it, our channel could) — `agora` ADR 0002.
+
+**Amendment 2026-07-05 (ADR 0010 — substrates).** The pod boundary generalises: one *shared*
+pod (this ADR's original shape) plus one sandboxed pod per conversation (*loges*), created by a
+trusted *manager* which holds the only ServiceAccount. "Libre dedans, borné dehors" now applies
+per-loge. See ADR 0010.
