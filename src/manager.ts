@@ -60,7 +60,11 @@ export function buildLogePodSpec(group: string, config: ManagerConfig): Record<s
       restartPolicy: 'Never',
       runtimeClassName: 'sandboxed',
       automountServiceAccountToken: false,
-      securityContext: { fsGroup: 1000, seccompProfile: { type: 'RuntimeDefault' } },
+      // runAsNonRoot at pod level so it covers every container uniformly (PSA `restricted`
+      // requires it explicitly true somewhere for EACH container — a real rejection hit live
+      // 2026-07-05: the initContainers didn't set it and agent-runs enforces restricted from
+      // birth, unlike the Phase V verrou namespace which was deliberately unlabelled).
+      securityContext: { fsGroup: 1000, seccompProfile: { type: 'RuntimeDefault' }, runAsNonRoot: true },
       initContainers: [
         {
           name: 'fetch-channel',
@@ -293,11 +297,17 @@ export class Manager {
         if ((err as HttpError).status === 409) {
           pod = await this.deps.k8s.getPod(podName) // AlreadyExists — adopt it
         } else {
+          // Incident 2026-07-05: this used to swallow the real reason (here, a PSA rejection —
+          // the initContainers didn't set runAsNonRoot, invisible in the Phase V verrou
+          // namespace which had no PSA). quota_exceeded is still the contract (ADR 0010 §1.1 —
+          // any pod-creation failure buckets here), but the operator needs the real cause logged.
+          console.error(`[manager] createPod failed for ${podName}:`, (err as HttpError).status, (err as Error).message, (err as HttpError).body)
           return { error: 'quota_exceeded' }
         }
       }
       const ready = await this.waitReady(podName)
       if (!ready) {
+        console.error(`[manager] ${podName} never became Ready within logeReadyTimeoutMs`)
         await this.deps.k8s.deletePod(podName).catch(() => {})
         return { error: 'quota_exceeded' }
       }
