@@ -27,6 +27,10 @@ export interface SessionInfo {
   /** Concrete model the runtime resolved its `--model <alias>` to (e.g. `sonnet` → `claude-sonnet-5`),
    *  read from the native transcript. Absent until the runtime's first turn is written. */
   model?: string
+  /** Topic title the runtime gave itself — claude re-titles its terminal tab with an
+   *  AI-generated topic each turn (OSC 0/2 escapes in the PTY stream, the only place it
+   *  exists: 2.1.x writes no summary lines). Latest one wins; absent until the first turn. */
+  title?: string
 }
 
 interface LiveSession extends SessionInfo {
@@ -131,21 +135,33 @@ export class Supervisor {
       transcriptBase,
     }
 
-    // The conversation flows through the channel, NOT the PTY (ADR 0004). We drain
-    // the PTY so its buffer never backs up, but we do not interpret the output.
+    // The conversation flows through the channel, NOT the PTY (ADR 0004). We drain the PTY so
+    // its buffer never backs up, and interpret exactly ONE thing in the stream: the OSC 0/2
+    // terminal-title escapes — claude re-titles its tab with an AI-generated topic each turn,
+    // and that stream is the only place the topic exists (probe 2026-07-05: no transcript
+    // summary lines in 2.1.x, sessions-registry names stay mechanical). A rolling tail keeps
+    // sequences split across chunks parseable; the LAST complete title wins.
     // With ptyLogDir set, the drain also tees to a per-session file (debug aid).
-    if (this.defaults.ptyLogDir) {
-      const logPath = join(this.defaults.ptyLogDir, `${id}.pty.log`)
-      proc.onData((data) => {
+    const logPath = this.defaults.ptyLogDir ? join(this.defaults.ptyLogDir, `${id}.pty.log`) : undefined
+    let oscTail = ''
+    proc.onData((data) => {
+      oscTail = (oscTail + data).slice(-1024)
+      let last: string | undefined
+      for (const m of oscTail.matchAll(/\x1b\][02];([^\x07\x1b]{0,200})(?:\x07|\x1b\\)/g)) last = m[1]
+      if (last !== undefined) {
+        // strip the spinner/status glyph prefix (braille frames, dingbats, ⏳ …); drop the
+        // idle/boot default — only a real topic may become the title
+        const topic = last.replace(/^[⠀-⣿✀-➿⏰-⏿·∗*\s]+/u, '').trim()
+        if (topic && topic !== 'Claude Code') session.title = topic
+      }
+      if (logPath) {
         try {
           appendFileSync(logPath, data)
         } catch {
           /* logging must never break the session */
         }
-      })
-    } else {
-      proc.onData(() => {})
-    }
+      }
+    })
     proc.onExit(({ exitCode }) => {
       // An exit we did NOT ask for = a crash. Keep the record (with its exitCode) so the
       // hub's reconcile reads it as `error`, then GC it (ADR 0009). A *voluntary* kill has
