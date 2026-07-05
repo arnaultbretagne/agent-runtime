@@ -8,8 +8,10 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
+    "start:manager": "node dist/manager.js",
     "dev": "tsx src/index.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/*.test.ts"
   },
   "dependencies": {
     "node-pty": "^1.0.0"

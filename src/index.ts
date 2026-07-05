@@ -4,6 +4,7 @@ import { readdirSync, readFileSync } from 'node:fs'
 import { Supervisor, BadRequest } from './supervisor.js'
 import { KNOWN_KINDS, RUNTIMES, isKnownKind } from './runtimes.js'
 import { getCapabilities } from './capabilities.js'
+import { envParam, transcriptParam } from './params.js'
 
 /**
  * Supervisor control API (ADR 0001/0002). The ONLY inbound surface, reachable
@@ -55,9 +56,27 @@ const server = createServer(async (req, res) => {
         // supervisor does not interpret it (the hub knows it is the harness cache TTL).
         const idleTtlMs =
           typeof body.idleTtlMs === 'number' && body.idleTtlMs > 0 ? body.idleTtlMs : undefined
+        // A resumed anchor, injected by the manager before the pty spawn (ADR 0010 §3/§4) — never
+        // clobbers a file already on this HOME (the pod-reuse case already has it).
+        const transcript = transcriptParam(body.transcript)
+        if (transcript) sup.writeTranscriptIfAbsent(transcript.sessionUuid, transcript.content)
         return send(res, 201, sup.spawn(body.kind, id, args, env, idleTtlMs))
       }
       return send(res, 405, { error: 'method not allowed' })
+    }
+
+    if (path === '/transcripts' && method === 'GET') {
+      return send(res, 200, { uuids: sup.listTranscriptUuids() })
+    }
+
+    const transcriptMatch = path.match(/^\/transcripts\/([^/]+)$/)
+    if (transcriptMatch) {
+      if (method !== 'GET') return send(res, 405, { error: 'method not allowed' })
+      const content = sup.readTranscript(decodeURIComponent(transcriptMatch[1]))
+      if (content === undefined) return send(res, 404, { error: 'not found' })
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' })
+      res.end(content)
+      return
     }
 
     const touchMatch = path.match(/^\/sessions\/([^/]+)\/touch$/)
@@ -162,14 +181,6 @@ server.listen(PORT, HOST, () => {
 function send(res: ServerResponse, code: number, body: unknown): void {
   res.writeHead(code, { 'content-type': 'application/json' })
   res.end(JSON.stringify(body))
-}
-
-function envParam(raw: unknown): Record<string, string> {
-  if (raw === undefined || raw === null) return {}
-  if (typeof raw !== 'object' || Array.isArray(raw)) throw new BadRequest('`env` must be an object')
-  const env: Record<string, string> = {}
-  for (const [k, v] of Object.entries(raw)) env[k] = String(v)
-  return env
 }
 
 async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {

@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import * as pty from 'node-pty'
 import { RUNTIMES, KNOWN_KINDS, isKnownKind } from './runtimes.js'
@@ -248,6 +248,61 @@ export class Supervisor {
     } catch {
       return 0
     }
+  }
+
+  /**
+   * Write a native transcript's content at the configured cwd's project slug, unless a file
+   * already exists there — never clobbering (agent-runtime ADR 0010 §3). This is how a resumed
+   * anchor enters a fresh loge: the manager injects the transcript it drained from a previous
+   * pod, and the existing `transcriptBase` snapshot (taken in `spawn`, right after this call)
+   * naturally sees the injected bytes as "a previous runtime's turns".
+   */
+  writeTranscriptIfAbsent(sessionUuid: string, content: string): void {
+    const dir = join(this.projectsDir, this.cwdSlug())
+    const file = join(dir, `${sessionUuid}.jsonl`)
+    if (existsSync(file)) return
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(file, content)
+  }
+
+  /** Every native transcript uuid present on this HOME, across all project slug dirs (stateless —
+   *  survives session GC; mirrors the scan `locateTranscript` does per-uuid). */
+  listTranscriptUuids(): string[] {
+    const uuids: string[] = []
+    let slugs: string[]
+    try {
+      slugs = readdirSync(this.projectsDir)
+    } catch {
+      return uuids
+    }
+    for (const slug of slugs) {
+      let files: string[]
+      try {
+        files = readdirSync(join(this.projectsDir, slug))
+      } catch {
+        continue
+      }
+      for (const f of files) {
+        if (f.endsWith('.jsonl')) uuids.push(f.slice(0, -'.jsonl'.length))
+      }
+    }
+    return uuids
+  }
+
+  /** The raw jsonl for a native transcript, or undefined if absent (checked across all slugs,
+   *  same lookup as the model-report reader). */
+  readTranscript(uuid: string): string | undefined {
+    const file = this.locateTranscript(uuid)
+    if (!file) return undefined
+    try {
+      return readFileSync(file, 'utf8')
+    } catch {
+      return undefined
+    }
+  }
+
+  private cwdSlug(): string {
+    return this.defaults.cwd.replace(/[/.]/g, '-')
   }
 
   /** Kill and forget a session. Returns false if the id is unknown. */
