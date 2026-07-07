@@ -225,11 +225,11 @@ export class Manager {
     }
   }
 
-  /** POST /sessions — creates or reuses the conversation's loge (isolated). `substrate` is a
-   *  legacy hint: the hub no longer sends it (placement is the manager's call, agora ADR 0011
-   *  superseded), so an absent substrate defaults to `isolated`. The `shared` branch is dead —
-   *  no client sends it and it would proxy to the decommissioned shared pod — kept only until a
-   *  follow-up removes it (with sharedSupervisorUrl and listAllSessions' shared merge). */
+  /** POST /sessions — routes by substrate, which is the manager's own concern (infra placement),
+   *  not the hub's: the hub sends none (agora ADR 0011 superseded), so an absent substrate takes
+   *  the manager's current default, `isolated` → get-or-create the conversation's loge. The
+   *  `shared` branch stays — substrate lives here and `shared` remains a value the manager
+   *  understands; its pod is undeployed today, so it's a latent capability, not dead code. */
   async spawn(body: Record<string, unknown>): Promise<{ status: number; body: unknown }> {
     const substrate = (body.substrate as string | undefined) ?? 'isolated'
     if (substrate !== 'shared' && substrate !== 'isolated') {
