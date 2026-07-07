@@ -156,8 +156,10 @@ test('spawn: creates a loge from baked config, with no substrate in the body (th
     const k8s = new MockK8s((name) => readyLoge(name, 'conv-x', ip))
     const manager = new Manager({ k8s, config: baseConfig(), readyPollMs: 5 })
     // no `substrate` field at all — the hub stopped sending it (it owns no placement policy)
-    const result = await manager.spawn({ kind: 'claude', args: [], group: 'conv-x' })
-    assert.equal(result.status, 201)
+    const result = await manager.spawn({ kind: 'claude', args: [], id: 'r-iso', group: 'conv-x' })
+    assert.equal(result.status, 202)
+    assert.deepEqual(result.body, { id: 'r-iso', status: 'creating' }, 'read-driven: accepted + booting, a fact — not a blocked call')
+    await manager.awaitSettled()
     assert.equal(k8s.createCalls, 1, 'absent substrate must create a loge, never proxy to the dead shared pod')
   } finally {
     await loge.close()
@@ -173,11 +175,36 @@ test('spawn: isolated substrate creates a loge once, reuses it for the same grou
   try {
     const k8s = new MockK8s((name) => readyLoge(name, 'conv-1', ip))
     const manager = new Manager({ k8s, config: baseConfig(), readyPollMs: 5 })
-    const r1 = await manager.spawn({ kind: 'claude', args: [], group: 'conv-1' })
-    const r2 = await manager.spawn({ kind: 'claude', args: [], group: 'conv-1' })
-    assert.equal(r1.status, 201)
-    assert.equal(r2.status, 201)
+    const r1 = await manager.spawn({ kind: 'claude', args: [], id: 'r1a', group: 'conv-1' })
+    await manager.awaitSettled() // first loge fully up before the second spawn → reuse, not a create race
+    const r2 = await manager.spawn({ kind: 'claude', args: [], id: 'r1b', group: 'conv-1' })
+    await manager.awaitSettled()
+    assert.equal(r1.status, 202)
+    assert.equal(r2.status, 202)
     assert.equal(k8s.createCalls, 1, 'the second spawn for the same group must reuse the loge')
+  } finally {
+    await loge.close()
+  }
+})
+
+test('read-driven liveness: `creating` right after spawn, `running` once the loge is up (GET /sessions/:id)', async () => {
+  const ip = allocLoopback()
+  const loge = await startFakeServer((method, path) => {
+    if (method === 'POST' && path === '/sessions') return json(201, { id: 'r-live', kind: 'claude', status: 'running' })
+    if (method === 'GET' && path === '/sessions/r-live') return json(200, { id: 'r-live', kind: 'claude', status: 'running' })
+    return json(404, { error: 'not found' })
+  }, LOGE_PORT, ip)
+  try {
+    const k8s = new MockK8s((name) => readyLoge(name, 'conv-live', ip))
+    const manager = new Manager({ k8s, config: baseConfig(), readyPollMs: 5 })
+    const r = await manager.spawn({ kind: 'claude', args: [], id: 'r-live', group: 'conv-live' })
+    assert.equal(r.status, 202)
+    // boot is a readable FACT (a local status), never an absence the hub must guess
+    assert.equal(((await manager.getSession('r-live')).body as any).status, 'creating')
+    await manager.awaitSettled()
+    const got = await manager.getSession('r-live')
+    assert.equal(got.status, 200)
+    assert.equal((got.body as any).status, 'running', 'creating → running once the loge reports it')
   } finally {
     await loge.close()
   }
@@ -197,8 +224,9 @@ test('resume resolution: loge already has the transcript -> forwarded untouched,
   try {
     const k8s = new MockK8s((name) => readyLoge(name, 'conv-2', ip))
     const manager = new Manager({ k8s, config: baseConfig(), readyPollMs: 5 })
-    const result = await manager.spawn({ kind: 'claude', args: ['--resume', 'u1'], group: 'conv-2' })
-    assert.equal(result.status, 201)
+    const result = await manager.spawn({ kind: 'claude', args: ['--resume', 'u1'], id: 'r2', group: 'conv-2' })
+    assert.equal(result.status, 202)
+    await manager.awaitSettled()
     assert.equal(received.transcript, undefined, 'loge-local transcript needs no injection')
   } finally {
     await loge.close()
@@ -222,8 +250,9 @@ test('resume resolution: missing from the loge, found in the anchor store -> inj
     writeFileSync(join(anchorDir, 'u2.jsonl'), '{"line":1}\n{"line":2}\n')
     const k8s = new MockK8s((name) => readyLoge(name, 'conv-3', ip))
     const manager = new Manager({ k8s, config: baseConfig({ anchorDir }), readyPollMs: 5 })
-    const result = await manager.spawn({ kind: 'claude', args: ['--resume', 'u2'], group: 'conv-3' })
-    assert.equal(result.status, 201)
+    const result = await manager.spawn({ kind: 'claude', args: ['--resume', 'u2'], id: 'r3', group: 'conv-3' })
+    assert.equal(result.status, 202)
+    await manager.awaitSettled()
     assert.deepEqual(received.transcript, { sessionUuid: 'u2', content: '{"line":1}\n{"line":2}\n' })
   } finally {
     await loge.close()
@@ -231,7 +260,7 @@ test('resume resolution: missing from the loge, found in the anchor store -> inj
   }
 })
 
-test('resume resolution: missing everywhere -> 409 anchor_transcript_missing, loge kept', async () => {
+test('resume resolution: missing everywhere -> exited{anchor_transcript_missing}, loge kept', async () => {
   const ip = allocLoopback()
   const loge = await startFakeServer((method, path) => {
     if (method === 'GET' && path === '/transcripts/u3') return json(404, { error: 'not found' })
@@ -241,10 +270,14 @@ test('resume resolution: missing everywhere -> 409 anchor_transcript_missing, lo
   try {
     const k8s = new MockK8s((name) => readyLoge(name, 'conv-4', ip))
     const manager = new Manager({ k8s, config: baseConfig({ anchorDir }), readyPollMs: 5 })
-    const result = await manager.spawn({ kind: 'claude', args: ['--resume', 'u3'], group: 'conv-4' })
-    assert.equal(result.status, 409)
-    assert.deepEqual(result.body, { error: 'anchor_transcript_missing' })
-    assert.equal(k8s.pods.size, 1, 'the loge itself is not torn down on a 409 — the retry (forceFresh) reuses it')
+    const result = await manager.spawn({ kind: 'claude', args: ['--resume', 'u3'], id: 'r-u3', group: 'conv-4' })
+    assert.equal(result.status, 202) // accepted; the failure surfaces as a READ status, not a sync 409
+    await manager.awaitSettled()
+    const got = await manager.getSession('r-u3')
+    assert.equal(got.status, 200)
+    assert.equal((got.body as any).status, 'exited')
+    assert.equal((got.body as any).reason, 'anchor_transcript_missing', 'the hub maps this to its one-shot forceFresh')
+    assert.equal(k8s.pods.size, 1, 'the loge itself is not torn down — the retry (forceFresh) reuses it')
   } finally {
     await loge.close()
     rmSync(anchorDir, { recursive: true, force: true })
@@ -260,8 +293,10 @@ test('sweepOnce: a Failed loge is tombstoned (exited + exitCode) then deleted', 
   try {
     const k8s = new MockK8s((name) => readyLoge(name, 'conv-5', ip))
     const manager = new Manager({ k8s, config: baseConfig(), readyPollMs: 5 })
-    const spawned = await manager.spawn({ kind: 'claude', args: [], group: 'conv-5' })
-    const runId = (spawned.body as { id: string }).id
+    const spawned = await manager.spawn({ kind: 'claude', args: [], id: 'r4', group: 'conv-5' })
+    assert.equal(spawned.status, 202)
+    await manager.awaitSettled() // loge up + run registered running before we fail its pod
+    const runId = 'r4'
 
     const pod = k8s.pods.get('loge-conv-5')
     pod.status.phase = 'Failed'
@@ -272,7 +307,8 @@ test('sweepOnce: a Failed loge is tombstoned (exited + exitCode) then deleted', 
     assert.equal(k8s.pods.has('loge-conv-5'), false, 'the pod is deleted after tombstoning')
     const got = await manager.getSession(runId)
     assert.equal(got.status, 200)
-    assert.deepEqual(got.body, { id: runId, status: 'exited', exitCode: 137 })
+    assert.equal((got.body as any).status, 'exited')
+    assert.equal((got.body as any).exitCode, 137)
   } finally {
     await loge.close()
   }
@@ -292,7 +328,9 @@ test('sweepOnce: drains a lingered-out empty loge (transcripts land in ANCHOR_DI
   try {
     const k8s = new MockK8s((name) => readyLoge(name, 'conv-6', ip))
     const manager = new Manager({ k8s, config: baseConfig({ anchorDir, logeLingerMs: 10 }), readyPollMs: 5 })
-    await manager.spawn({ kind: 'claude', args: [], group: 'conv-6' })
+    const r = await manager.spawn({ kind: 'claude', args: [], id: 'r5', group: 'conv-6' })
+    assert.equal(r.status, 202)
+    await manager.awaitSettled()
 
     await manager.sweepOnce() // sees 0 sessions -> sets lastEmptyAt
     assert.equal(k8s.pods.has('loge-conv-6'), true, 'still lingering, not drained yet')
