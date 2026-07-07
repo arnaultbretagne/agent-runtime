@@ -20,13 +20,16 @@ FROM ${BASE}
 # allowlist baked at /etc/claude-code (that approval is what lets the install/consume succeed).
 # Keep the channel's delivery copy in the image so the installed marketplace path resolves.
 COPY --from=channel --chown=node:node /opt/agora /opt/agora
-# Install once, at build. Then MOVE the installed plugin tree OUT of ~/.claude — the loge mounts an
-# emptyDir on ~/.claude at runtime, which would hide anything baked under it; the seed initContainer
-# `cp`s /home/node/agora-plugins into the fresh HOME (sub-second) at boot. The durable state a cold
-# claude needs is exactly this cache (proven by loge linger-reuse: cache present ⇒ no reinstall).
+# Install once, at build. Then stash the install's durable output OUT of ~/.claude — the loge mounts
+# an emptyDir on ~/.claude at runtime, which would hide anything baked under it; the seed
+# initContainer restores it into the fresh HOME (sub-second) at boot. Two pieces matter: the plugin
+# tree (~/.claude/plugins) AND settings.json — the latter carries `enabledPlugins`, which is what
+# makes claude spawn the channel's MCP server (without it the plugin loads but the bridge never runs).
 RUN claude plugin marketplace add /opt/agora \
  && claude plugin install agora@agora \
- && mv /home/node/.claude/plugins /home/node/agora-plugins
+ && mkdir -p /home/node/agora-state \
+ && mv /home/node/.claude/plugins /home/node/agora-state/plugins \
+ && cp /home/node/.claude/settings.json /home/node/agora-state/settings.json
 # claude REWRITES ~/.claude.json on every run — the install above stripped the base's baked
 # onboarding/trust/bypass-acceptance flags (hasCompletedOnboarding, bypassPermissionsModeAccepted),
 # so a runtime claude would hang on the interactive "Bypass Permissions mode" prompt. Restore the
