@@ -162,6 +162,9 @@ type RunLocation = { where: 'shared' } | { where: 'loge'; podName: string; group
 interface Tombstone {
   status: 'exited'
   exitCode?: number
+  /** Why a `creating` run failed (ADR 0010 amendment 2026-07-07) — read by the hub; e.g.
+   *  `anchor_transcript_missing` drives its one-shot forceFresh, as the old synchronous 409 did. */
+  reason?: string
   expiresAt: number
 }
 
@@ -205,6 +208,13 @@ export class Manager {
   private readonly runLocations = new Map<string, RunLocation>()
   private readonly loges = new Map<string, LogeEntry>()
   private readonly tombstones = new Map<string, Tombstone>()
+  /** Read-driven liveness (ADR 0010 amendment 2026-07-07): an isolated spawn registers here the
+   *  instant its POST arrives, giving the run a readable `creating` status (via GET /sessions/:id)
+   *  while its loge is built in the background. Deliberately kept OUT of GET /sessions (the list) so
+   *  an old hub still reads boot as absence during the manager-first rollout. */
+  private readonly creating = new Map<string, { group: string; since: number }>()
+  /** In-flight background loge creations, keyed by run id — awaited by tests and graceful shutdown. */
+  private readonly settling = new Map<string, Promise<void>>()
   private readonly createGate: CreateGate
   private readonly readyPollMs: number
 
@@ -253,19 +263,58 @@ export class Manager {
     if (typeof group !== 'string' || !group) {
       return { status: 400, body: { error: '`group` is required for substrate=isolated' } }
     }
-    const loge = await this.getOrCreateLoge(group)
-    if ('error' in loge) return { status: 503, body: { error: loge.error } }
-
-    const resumeUuid = this.extractResumeUuid(forwarded.args)
-    if (resumeUuid) {
-      const resolved = await this.resolveResumeTranscript(loge.podIp, resumeUuid)
-      if (resolved === undefined) return { status: 409, body: { error: 'anchor_transcript_missing' } }
-      if (resolved !== null) forwarded.transcript = { sessionUuid: resumeUuid, content: resolved }
+    const id = forwarded.id as string | undefined
+    if (typeof id !== 'string' || !id) {
+      return { status: 400, body: { error: '`id` is required for substrate=isolated' } }
     }
 
-    const result = await this.forwardSpawn(`http://${loge.podIp}:8080`, forwarded)
-    this.rememberSpawnLocation(result, { where: 'loge', podName: loge.podName, group })
-    return result
+    // Read-driven liveness (ADR 0010 amendment 2026-07-07): register `creating` and return at once;
+    // build the loge in the background. The hub READS the status (creating → running | exited) via
+    // GET /sessions/:id instead of guessing boot from an ambiguous absence + a settle window.
+    this.creating.set(id, { group, since: Date.now() })
+    this.settling.set(id, this.createLogeAndForward(id, group, forwarded).finally(() => this.settling.delete(id)))
+    return { status: 202, body: { id, status: 'creating' } }
+  }
+
+  /** The background half of an isolated spawn: create/reuse the loge, inject resume custody (§4),
+   *  forward — resolving the run's readable status (creating → running | exited). Bounded by
+   *  getOrCreateLoge's own timeout, so a `creating` run always resolves to a definite fact. */
+  private async createLogeAndForward(id: string, group: string, forwarded: Record<string, unknown>): Promise<void> {
+    try {
+      const loge = await this.getOrCreateLoge(group)
+      if ('error' in loge) return this.markExited(id, loge.error)
+
+      const resumeUuid = this.extractResumeUuid(forwarded.args)
+      if (resumeUuid) {
+        const resolved = await this.resolveResumeTranscript(loge.podIp, resumeUuid)
+        // §4: the anchor transcript is gone everywhere → a terminal, readable fact. The hub maps it
+        // to its one-shot forceFresh, exactly as the old synchronous 409 did.
+        if (resolved === undefined) return this.markExited(id, 'anchor_transcript_missing')
+        if (resolved !== null) forwarded.transcript = { sessionUuid: resumeUuid, content: resolved }
+      }
+
+      const result = await this.forwardSpawn(`http://${loge.podIp}:8080`, forwarded)
+      if (result.status >= 200 && result.status < 300) {
+        // Running now — the loge reports it via its own /sessions; drop the creating marker.
+        this.rememberSpawnLocation(result, { where: 'loge', podName: loge.podName, group })
+        this.creating.delete(id)
+      } else {
+        this.markExited(id, `forward_failed_${result.status}`)
+      }
+    } catch (err) {
+      this.markExited(id, (err as Error).message)
+    }
+  }
+
+  /** creating → exited{reason}: a readable, TTL'd terminal fact (mirrors the Failed-pod tombstone). */
+  private markExited(id: string, reason: string): void {
+    this.creating.delete(id)
+    this.tombstones.set(id, { status: 'exited', reason, expiresAt: Date.now() + EXITED_TOMBSTONE_MS })
+  }
+
+  /** Test/shutdown aid: await every in-flight background loge creation. */
+  async awaitSettled(): Promise<void> {
+    await Promise.all([...this.settling.values()])
   }
 
   /** Resolution order (§1.1): loge-local (pod-reuse case, nothing to inject) > the manager's own
@@ -542,15 +591,19 @@ export class Manager {
         }
       }),
     )
+    // NB: `creating` runs are intentionally NOT listed here (see the `creating` field) — the list
+    // stays absence-based for an old hub; the new hub reads `creating` via GET /sessions/:id.
     for (const [id, tomb] of this.tombstones) {
-      results.push({ id, status: tomb.status, exitCode: tomb.exitCode })
+      results.push({ id, status: tomb.status, exitCode: tomb.exitCode, reason: tomb.reason })
     }
     return results
   }
 
   async getSession(id: string): Promise<{ status: number; body: unknown }> {
+    // Read-driven liveness (ADR 0010 amendment): a still-booting run is a fact, not an absence.
+    if (this.creating.has(id)) return { status: 200, body: { id, status: 'creating' } }
     const tomb = this.tombstones.get(id)
-    if (tomb) return { status: 200, body: { id, status: tomb.status, exitCode: tomb.exitCode } }
+    if (tomb) return { status: 200, body: { id, status: tomb.status, exitCode: tomb.exitCode, reason: tomb.reason } }
     const loc = this.runLocations.get(id)
     if (!loc) return { status: 404, body: { error: 'not found' } }
     const base = await this.baseUrlFor(loc)
