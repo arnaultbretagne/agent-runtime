@@ -75,10 +75,11 @@ export function buildLogePodSpec(group: string, config: ManagerConfig): Record<s
       securityContext: { fsGroup: 1000, seccompProfile: { type: 'RuntimeDefault' }, runAsNonRoot: true, runAsUser: 1000 },
       initContainers: [
         {
-          // Read-driven boot (ADR 0010 amendment 2026-07-07): the loge image bakes the installed
-          // channel plugin at /home/node/agora-plugins (see Dockerfile.loge). Copy it into the fresh
-          // emptyDir HOME — sub-second — instead of running `claude plugin install` (~14s) on every
-          // cold boot. The `if` keeps a lingered-then-reused loge from re-copying.
+          // Read-driven boot (ADR 0010 amendment 2026-07-07): the loge image bakes the plugin
+          // install's durable output at /home/node/agora-state (see Dockerfile.loge) — plugins/ AND
+          // settings.json (which carries enabledPlugins → claude spawns the channel MCP server).
+          // Restore both into the fresh emptyDir HOME (sub-second) instead of running `claude plugin
+          // install` (~14s) on every cold boot. The `if` keeps a lingered-then-reused loge from re-copying.
           name: 'seed',
           image: config.logeImage,
           command: [
@@ -86,8 +87,9 @@ export function buildLogePodSpec(group: string, config: ManagerConfig): Record<s
             '-c',
             'set -e\n' +
               'if [ ! -d "$HOME/.claude/plugins/cache/agora" ]; then\n' +
-              '  echo "copying baked agora channel plugin"\n' +
-              '  cp -a /home/node/agora-plugins "$HOME/.claude/plugins"\n' +
+              '  echo "restoring baked agora channel plugin + settings"\n' +
+              '  cp -a /home/node/agora-state/plugins "$HOME/.claude/plugins"\n' +
+              '  cp -a /home/node/agora-state/settings.json "$HOME/.claude/settings.json"\n' +
               'else\n' +
               '  echo "agora plugin already present — keeping"\n' +
               'fi\n',
