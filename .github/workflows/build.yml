@@ -17,6 +17,8 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # --- agent-runtime: the generic base (manager + loge base, channel-agnostic) ---
       - uses: docker/metadata-action@v5
         id: meta
         with:
@@ -26,8 +28,30 @@ jobs:
             type=sha,prefix=sha-
             type=raw,value=latest,enable={{is_default_branch}}
       - uses: docker/build-push-action@v6
+        id: base
         with:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      # --- loge: the base + the agora channel plugin baked (ADR 0010 amendment 2026-07-07) ---
+      # Pinned to the base just built (by digest) so install-time claude == runtime claude.
+      - uses: docker/metadata-action@v5
+        id: meta-loge
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/loge
+          tags: |
+            type=semver,pattern={{version}}
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.loge
+          push: true
+          build-args: |
+            BASE=ghcr.io/${{ github.repository_owner }}/agent-runtime@${{ steps.base.outputs.digest }}
+            CHANNEL=ghcr.io/${{ github.repository_owner }}/agora-website:latest
+          tags: ${{ steps.meta-loge.outputs.tags }}
+          labels: ${{ steps.meta-loge.outputs.labels }}
