@@ -145,6 +145,24 @@ test('spawn: shared proxy unreachable -> honest 502, never a fabricated quota_ex
   assert.equal((result.body as { error: string }).error, 'spawn_forward_failed')
 })
 
+test('spawn: absent substrate defaults to isolated — creates a loge (the post-removal hub payload)', async () => {
+  const ip = allocLoopback()
+  const loge = await startFakeServer((method, path) => {
+    if (method === 'POST' && path === '/sessions') return json(201, { id: 'r-iso', kind: 'claude', status: 'running' })
+    return json(404, { error: 'not found' })
+  }, LOGE_PORT, ip)
+  try {
+    const k8s = new MockK8s((name) => readyLoge(name, 'conv-x', ip))
+    const manager = new Manager({ k8s, config: baseConfig(), readyPollMs: 5 })
+    // no `substrate` field at all — the hub stopped sending it (it owns no placement policy)
+    const result = await manager.spawn({ kind: 'claude', args: [], group: 'conv-x' })
+    assert.equal(result.status, 201)
+    assert.equal(k8s.createCalls, 1, 'absent substrate must create a loge, never proxy to the dead shared pod')
+  } finally {
+    await loge.close()
+  }
+})
+
 test('spawn: isolated substrate creates a loge once, reuses it for the same group', async () => {
   const ip = allocLoopback()
   const loge = await startFakeServer((method, path) => {
