@@ -14,6 +14,7 @@ function sleep(ms: number): Promise<void> {
 function baseConfig(overrides: Partial<ManagerConfig> = {}): ManagerConfig {
   return {
     port: 0,
+    substrate: 'isolated',
     sharedSupervisorUrl: 'http://127.0.0.1:1', // unused unless a test overrides it
     agentRunsNs: 'agent-runs',
     logeImage: 'ghcr.io/example/agent-runtime@sha256:deadbeef',
@@ -113,7 +114,7 @@ function readyLoge(name: string, group: string, podIP: string) {
   }
 }
 
-test('spawn: shared substrate proxies verbatim, stripping substrate/group', async () => {
+test('spawn: shared config proxies verbatim to the shared supervisor (no body substrate)', async () => {
   let received: any
   const shared = await startFakeServer((method, path, body) => {
     if (method === 'POST' && path === '/sessions') {
@@ -124,8 +125,8 @@ test('spawn: shared substrate proxies verbatim, stripping substrate/group', asyn
   }, 0, '127.0.0.1')
   try {
     const k8s = new MockK8s((name) => readyLoge(name, 'unused', '127.0.0.1'))
-    const manager = new Manager({ k8s, config: baseConfig({ sharedSupervisorUrl: shared.url }) })
-    const result = await manager.spawn({ kind: 'claude', args: ['--session-id', 'u1'], substrate: 'shared' })
+    const manager = new Manager({ k8s, config: baseConfig({ sharedSupervisorUrl: shared.url, substrate: 'shared' }) })
+    const result = await manager.spawn({ kind: 'claude', args: ['--session-id', 'u1'] })
     assert.equal(result.status, 201)
     assert.deepEqual(result.body, { id: 'r1', kind: 'claude', status: 'running' })
     assert.deepEqual(received, { kind: 'claude', args: ['--session-id', 'u1'] })
@@ -139,10 +140,28 @@ test('spawn: shared proxy unreachable -> honest 502, never a fabricated quota_ex
   // Incident 2026-07-05: a CNP gap made this fetch throw, and the old code mapped ANY forwardSpawn
   // exception to quota_exceeded — indistinguishable from a real loge-creation quota problem.
   const k8s = new MockK8s((name) => readyLoge(name, 'unused', '127.0.0.1'))
-  const manager = new Manager({ k8s, config: baseConfig({ sharedSupervisorUrl: 'http://127.0.0.1:1' }) })
-  const result = await manager.spawn({ kind: 'claude', args: [], substrate: 'shared' })
+  const manager = new Manager({ k8s, config: baseConfig({ sharedSupervisorUrl: 'http://127.0.0.1:1', substrate: 'shared' }) })
+  const result = await manager.spawn({ kind: 'claude', args: [] })
   assert.equal(result.status, 502)
   assert.equal((result.body as { error: string }).error, 'spawn_forward_failed')
+})
+
+test('spawn: creates a loge from baked config, with no substrate in the body (the hub sends none)', async () => {
+  const ip = allocLoopback()
+  const loge = await startFakeServer((method, path) => {
+    if (method === 'POST' && path === '/sessions') return json(201, { id: 'r-iso', kind: 'claude', status: 'running' })
+    return json(404, { error: 'not found' })
+  }, LOGE_PORT, ip)
+  try {
+    const k8s = new MockK8s((name) => readyLoge(name, 'conv-x', ip))
+    const manager = new Manager({ k8s, config: baseConfig(), readyPollMs: 5 })
+    // no `substrate` field at all — the hub stopped sending it (it owns no placement policy)
+    const result = await manager.spawn({ kind: 'claude', args: [], group: 'conv-x' })
+    assert.equal(result.status, 201)
+    assert.equal(k8s.createCalls, 1, 'absent substrate must create a loge, never proxy to the dead shared pod')
+  } finally {
+    await loge.close()
+  }
 })
 
 test('spawn: isolated substrate creates a loge once, reuses it for the same group', async () => {
@@ -154,8 +173,8 @@ test('spawn: isolated substrate creates a loge once, reuses it for the same grou
   try {
     const k8s = new MockK8s((name) => readyLoge(name, 'conv-1', ip))
     const manager = new Manager({ k8s, config: baseConfig(), readyPollMs: 5 })
-    const r1 = await manager.spawn({ kind: 'claude', args: [], substrate: 'isolated', group: 'conv-1' })
-    const r2 = await manager.spawn({ kind: 'claude', args: [], substrate: 'isolated', group: 'conv-1' })
+    const r1 = await manager.spawn({ kind: 'claude', args: [], group: 'conv-1' })
+    const r2 = await manager.spawn({ kind: 'claude', args: [], group: 'conv-1' })
     assert.equal(r1.status, 201)
     assert.equal(r2.status, 201)
     assert.equal(k8s.createCalls, 1, 'the second spawn for the same group must reuse the loge')
@@ -178,7 +197,7 @@ test('resume resolution: loge already has the transcript -> forwarded untouched,
   try {
     const k8s = new MockK8s((name) => readyLoge(name, 'conv-2', ip))
     const manager = new Manager({ k8s, config: baseConfig(), readyPollMs: 5 })
-    const result = await manager.spawn({ kind: 'claude', args: ['--resume', 'u1'], substrate: 'isolated', group: 'conv-2' })
+    const result = await manager.spawn({ kind: 'claude', args: ['--resume', 'u1'], group: 'conv-2' })
     assert.equal(result.status, 201)
     assert.equal(received.transcript, undefined, 'loge-local transcript needs no injection')
   } finally {
@@ -203,7 +222,7 @@ test('resume resolution: missing from the loge, found in the anchor store -> inj
     writeFileSync(join(anchorDir, 'u2.jsonl'), '{"line":1}\n{"line":2}\n')
     const k8s = new MockK8s((name) => readyLoge(name, 'conv-3', ip))
     const manager = new Manager({ k8s, config: baseConfig({ anchorDir }), readyPollMs: 5 })
-    const result = await manager.spawn({ kind: 'claude', args: ['--resume', 'u2'], substrate: 'isolated', group: 'conv-3' })
+    const result = await manager.spawn({ kind: 'claude', args: ['--resume', 'u2'], group: 'conv-3' })
     assert.equal(result.status, 201)
     assert.deepEqual(received.transcript, { sessionUuid: 'u2', content: '{"line":1}\n{"line":2}\n' })
   } finally {
@@ -222,7 +241,7 @@ test('resume resolution: missing everywhere -> 409 anchor_transcript_missing, lo
   try {
     const k8s = new MockK8s((name) => readyLoge(name, 'conv-4', ip))
     const manager = new Manager({ k8s, config: baseConfig({ anchorDir }), readyPollMs: 5 })
-    const result = await manager.spawn({ kind: 'claude', args: ['--resume', 'u3'], substrate: 'isolated', group: 'conv-4' })
+    const result = await manager.spawn({ kind: 'claude', args: ['--resume', 'u3'], group: 'conv-4' })
     assert.equal(result.status, 409)
     assert.deepEqual(result.body, { error: 'anchor_transcript_missing' })
     assert.equal(k8s.pods.size, 1, 'the loge itself is not torn down on a 409 — the retry (forceFresh) reuses it')
@@ -241,7 +260,7 @@ test('sweepOnce: a Failed loge is tombstoned (exited + exitCode) then deleted', 
   try {
     const k8s = new MockK8s((name) => readyLoge(name, 'conv-5', ip))
     const manager = new Manager({ k8s, config: baseConfig(), readyPollMs: 5 })
-    const spawned = await manager.spawn({ kind: 'claude', args: [], substrate: 'isolated', group: 'conv-5' })
+    const spawned = await manager.spawn({ kind: 'claude', args: [], group: 'conv-5' })
     const runId = (spawned.body as { id: string }).id
 
     const pod = k8s.pods.get('loge-conv-5')
@@ -273,7 +292,7 @@ test('sweepOnce: drains a lingered-out empty loge (transcripts land in ANCHOR_DI
   try {
     const k8s = new MockK8s((name) => readyLoge(name, 'conv-6', ip))
     const manager = new Manager({ k8s, config: baseConfig({ anchorDir, logeLingerMs: 10 }), readyPollMs: 5 })
-    await manager.spawn({ kind: 'claude', args: [], substrate: 'isolated', group: 'conv-6' })
+    await manager.spawn({ kind: 'claude', args: [], group: 'conv-6' })
 
     await manager.sweepOnce() // sees 0 sessions -> sets lastEmptyAt
     assert.equal(k8s.pods.has('loge-conv-6'), true, 'still lingering, not drained yet')
