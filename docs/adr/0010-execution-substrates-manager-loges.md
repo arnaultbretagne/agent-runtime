@@ -180,9 +180,13 @@ reads**, never a guess. The hub already reads it for death (`404`) and crash (`F
 
    `creating` therefore **cannot outlive the manager's timeout** — it always resolves to a definite fact.
 
-2. **`GET /sessions` and `GET /sessions/:id` report `creating`** alongside `running`/`exited`/`404`.
-   Additive and substrate-agnostic: a `shared` spawn is synchronous and never emits `creating`, so §2's
-   aggregation contract only *grows*.
+2. **`GET /sessions/:id` reports `creating`** alongside `running`/`exited`/`404` — the per-run read the
+   hub uses for a pending spawn. `GET /sessions` (the list) deliberately keeps `creating` runs *absent*,
+   so an old hub still reads boot as absence during the manager-first rollout (its pending loop would
+   otherwise misread a non-`running`, non-absent status as death); the new hub reads `creating` via
+   `/:id` per pending entry. Additive and substrate-agnostic: a `shared` spawn is synchronous and never
+   emits `creating`. (Surfacing `creating` in the list too is a trivial follow-up once the old hub is
+   retired.)
 
 3. **The hub reads, then reacts.** Its spawn call returns fast; liveness is driven by the existing 3s
    poll: `creating` → still booting, wait (a fact — no window); `running` → live; `exited`/`404` → the
