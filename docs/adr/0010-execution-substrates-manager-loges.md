@@ -3,6 +3,8 @@
 ## Status
 
 Accepted — 2026-07-05 (verrous V1–V3 passés — voir RUNLOG `/srv/runtime-isolation-plan.RUNLOG.md`).
+**Amended 2026-07-07** — read-driven liveness: the manager reports a `creating` status so the hub
+*reads* boot as a fact instead of *guessing* it via a settle window. See the amendment at the end.
 **Extends ADR 0001** (the supervisor stays a thin process manager — a *manager* appears above it),
 **ADR 0003** (the pod boundary generalises to per-conversation pods) and **ADR 0004** (one image, two
 entrypoints). Leaves **ADR 0008** untouched (the idle clock still lives with the session).
@@ -145,3 +147,66 @@ those credentials' scopes, not by gVisor.
   path needs this ADR's manager-side CNP *and* the paired website-ingress amendment (infra-k8s ADR
   0028 §3) deployed together, verified analytically via Cilium drop logs pending that joint rollout —
   in `/srv/runtime-isolation-plan.RUNLOG.md`).
+
+## Amendment 2026-07-07 — Read-driven liveness: the manager reports `creating`, the hub stops guessing
+
+Supersedes the settle-window half of §2's aggregation, and pairs with agora's hub change (which drops
+`ISOLATED_SPAWN_SETTLE_MS` and the per-pending `isolated` flag). Note in passing: §1's `substrate`
+POST-field is itself superseded — substrate is now baked manager config (this repo #1 / agora ADR 0011
+revised), so `group` is the spawn's only placement-related input.
+
+**The defect.** §2 has the manager forward an isolated spawn only *after* the loge is Ready — up to
+`LOGE_READY_TIMEOUT_MS` (90s). Until then the run is **absent** from `GET /sessions`, and absence is
+ambiguous: still booting, or dead-before-registering? The hub resolved it by *guessing* — a 120s
+settle window that (a) encodes loge-boot latency in the product layer (a leak), and (b) is anchored to
+the hub's own in-flight spawn call, so if that call never returns (manager unreachable, unbounded
+fetch) the conversation hangs in `starting` **forever, undead**. Liveness must be a **fact the hub
+reads**, never a guess. The hub already reads it for death (`404`) and crash (`Failed`→`exited`); the
+*only* unread state is boot.
+
+**The principle.** The manager owns loge liveness authoritatively — it drives the pod. It must expose
+*every* state as a readable fact, the in-flight one included, so the hub never infers from absence.
+
+**The change.**
+
+1. **Async spawn + a first-class `creating` status.** On `POST /sessions` (isolated), the manager
+   registers the run id (carried in the body) as `creating` **immediately** and returns fast —
+   `202 { id, status: 'creating' }` — then creates/reuses the loge in the background (custody
+   injection, §4, included). The status then transitions, bounded by the manager's own clock:
+   - `creating` → `running` — loge Ready and the inner `POST /sessions` forwarded OK;
+   - `creating` → `exited` (`{ reason }`) — `LOGE_READY_TIMEOUT_MS` elapsed, the quota refused, or the
+     forward failed; the `409 anchor_transcript_missing` case (§4) becomes
+     `exited { reason: 'anchor_transcript_missing' }`.
+
+   `creating` therefore **cannot outlive the manager's timeout** — it always resolves to a definite fact.
+
+2. **`GET /sessions/:id` reports `creating`** alongside `running`/`exited`/`404` — the per-run read the
+   hub uses for a pending spawn. `GET /sessions` (the list) deliberately keeps `creating` runs *absent*,
+   so an old hub still reads boot as absence during the manager-first rollout (its pending loop would
+   otherwise misread a non-`running`, non-absent status as death); the new hub reads `creating` via
+   `/:id` per pending entry. Additive and substrate-agnostic: a `shared` spawn is synchronous and never
+   emits `creating`. (Surfacing `creating` in the list too is a trivial follow-up once the old hub is
+   retired.)
+
+3. **The hub reads, then reacts.** Its spawn call returns fast; liveness is driven by the existing 3s
+   poll: `creating` → still booting, wait (a fact — no window); `running` → live; `exited`/`404` → the
+   existing verdict (fallback / error / dormant), **unchanged**. The reaper's *reaction* half
+   (clear/advance the anchor, re-seed, one-shot `forceFresh`) is untouched — only its *input* changes,
+   a read status instead of a guessed absence. The hub deletes `ISOLATED_SPAWN_SETTLE_MS` and the
+   per-pending `isolated` flag entirely.
+
+**Consequences.**
+
+- **No hang.** `creating` is bounded by the manager; "manager unreachable" is a poll failure the hub
+  already tolerates (retry, no kill). The spawn call no longer blocks for the whole boot, so a stalled
+  connection can no longer wedge a conversation undead.
+- **`409 anchor_transcript_missing` moves from a synchronous spawn response to an `exited { reason }`
+  status** — the hub's one-shot `forceFresh` reaction is identical, just triggered on read.
+- **Rollout ordering** (mirrors the substrate change): deploy the **manager first** (async +
+  `creating`), then the hub (read-driven). A new manager stays compatible with the *old* hub — its
+  settle window still tolerates the async boot and the channel attach still confirms life; it merely
+  keeps guessing on failure. A read-driven hub against an *old* (blocking, no-`creating`) manager is
+  the unsafe combo — hence manager-first.
+- **What stays.** The 3s poll cadence, the runId→location map, the `Failed`→`exited` tombstone (§2),
+  custody (§4), the re-seed floor (agora ADR 0007). This amendment adds one status value and flips the
+  spawn from blocking to fire-and-read; it *removes* a guess, it introduces no new invariant.
