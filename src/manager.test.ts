@@ -18,7 +18,6 @@ function baseConfig(overrides: Partial<ManagerConfig> = {}): ManagerConfig {
     sharedSupervisorUrl: 'http://127.0.0.1:1', // unused unless a test overrides it
     agentRunsNs: 'agent-runs',
     logeImage: 'ghcr.io/example/agent-runtime@sha256:deadbeef',
-    channelImage: 'ghcr.io/example/agora-website:latest',
     logeLingerMs: 120_000,
     maxConcurrentLogeCreates: 2,
     logeReadyTimeoutMs: 2000,

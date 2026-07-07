@@ -1,0 +1,32 @@
+# syntax=docker/dockerfile:1
+#
+# loge image (agent-runtime ADR 0010 amendment 2026-07-07): the generic runtime + the agora
+# channel plugin BAKED at build. A cold loge then boots with a `cp` instead of a ~14s
+# `claude plugin install` — the plugin used to reinstall on EVERY ephemeral (emptyDir) HOME.
+# Derived on purpose, so `agent-runtime` stays channel-agnostic (the manager runs the base, no
+# channel); only this variant knows about agora.
+#
+# BASE is pinned by CI to the exact agent-runtime built from the same commit (digest) → the
+# `claude plugin install` runs with the SAME claude that consumes it at runtime = zero version drift.
+# CHANNEL is where agora already publishes its channel delivery copy (its own image, /opt/agora).
+
+ARG BASE=ghcr.io/arnaultbretagne/agent-runtime:latest
+ARG CHANNEL=ghcr.io/arnaultbretagne/agora-website:latest
+
+FROM ${CHANNEL} AS channel
+
+FROM ${BASE}
+# The base has: claude in ~/.local, USER node, HOME=/home/node, and the managed-settings plugin
+# allowlist baked at /etc/claude-code (that approval is what lets the install/consume succeed).
+# Keep the channel's delivery copy in the image so the installed marketplace path resolves.
+COPY --from=channel --chown=node:node /opt/agora /opt/agora
+# Install once, at build. Then MOVE the installed plugin tree OUT of ~/.claude — the loge mounts an
+# emptyDir on ~/.claude at runtime, which would hide anything baked under it; the seed initContainer
+# `cp`s /home/node/agora-plugins into the fresh HOME (sub-second) at boot. The durable state a cold
+# claude needs is exactly this cache (proven by loge linger-reuse: cache present ⇒ no reinstall).
+RUN claude plugin marketplace add /opt/agora \
+ && claude plugin install agora@agora \
+ && mv /home/node/.claude/plugins /home/node/agora-plugins
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["node", "dist/index.js"]

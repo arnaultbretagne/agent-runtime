@@ -19,7 +19,6 @@ export interface ManagerConfig {
   sharedSupervisorUrl: string
   agentRunsNs: string
   logeImage: string
-  channelImage: string
   logeLingerMs: number
   maxConcurrentLogeCreates: number
   logeReadyTimeoutMs: number
@@ -41,7 +40,6 @@ export function configFromEnv(env: NodeJS.ProcessEnv): ManagerConfig {
     sharedSupervisorUrl: env.SHARED_SUPERVISOR_URL ?? 'http://agent:8080',
     agentRunsNs: env.AGENT_RUNS_NS ?? 'agent-runs',
     logeImage,
-    channelImage: env.CHANNEL_IMAGE ?? 'ghcr.io/arnaultbretagne/agora-website:latest',
     logeLingerMs: Number(env.LOGE_LINGER_MS ?? 120_000),
     maxConcurrentLogeCreates: Number(env.MAX_CONCURRENT_LOGE_CREATES ?? 2),
     logeReadyTimeoutMs: Number(env.LOGE_READY_TIMEOUT_MS ?? 90_000),
@@ -77,13 +75,10 @@ export function buildLogePodSpec(group: string, config: ManagerConfig): Record<s
       securityContext: { fsGroup: 1000, seccompProfile: { type: 'RuntimeDefault' }, runAsNonRoot: true, runAsUser: 1000 },
       initContainers: [
         {
-          name: 'fetch-channel',
-          image: config.channelImage,
-          command: ['sh', '-c', 'cp -r /opt/agora/. /channel-src/'],
-          volumeMounts: [{ name: 'channel-src', mountPath: '/channel-src' }],
-          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ['ALL'] } },
-        },
-        {
+          // Read-driven boot (ADR 0010 amendment 2026-07-07): the loge image bakes the installed
+          // channel plugin at /home/node/agora-plugins (see Dockerfile.loge). Copy it into the fresh
+          // emptyDir HOME — sub-second — instead of running `claude plugin install` (~14s) on every
+          // cold boot. The `if` keeps a lingered-then-reused loge from re-copying.
           name: 'seed',
           image: config.logeImage,
           command: [
@@ -91,18 +86,14 @@ export function buildLogePodSpec(group: string, config: ManagerConfig): Record<s
             '-c',
             'set -e\n' +
               'if [ ! -d "$HOME/.claude/plugins/cache/agora" ]; then\n' +
-              '  echo "installing agora channel plugin"\n' +
-              '  claude plugin marketplace add /channel-src\n' +
-              '  claude plugin install agora@agora\n' +
+              '  echo "copying baked agora channel plugin"\n' +
+              '  cp -a /home/node/agora-plugins "$HOME/.claude/plugins"\n' +
               'else\n' +
-              '  echo "agora plugin already installed — keeping"\n' +
+              '  echo "agora plugin already present — keeping"\n' +
               'fi\n',
           ],
           env: [{ name: 'HOME', value: '/home/node' }],
-          volumeMounts: [
-            { name: 'claude', mountPath: '/home/node/.claude' },
-            { name: 'channel-src', mountPath: '/channel-src' },
-          ],
+          volumeMounts: [{ name: 'claude', mountPath: '/home/node/.claude' }],
           securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ['ALL'] } },
         },
       ],
@@ -134,14 +125,12 @@ export function buildLogePodSpec(group: string, config: ManagerConfig): Record<s
           readinessProbe: { httpGet: { path: '/healthz', port: 8080 }, periodSeconds: 2 },
           volumeMounts: [
             { name: 'claude', mountPath: '/home/node/.claude' },
-            { name: 'channel-src', mountPath: '/channel-src', readOnly: true },
             { name: 'logs', mountPath: '/logs' },
           ],
         },
       ],
       volumes: [
         { name: 'claude', emptyDir: { sizeLimit: '1Gi' } },
-        { name: 'channel-src', emptyDir: {} },
         { name: 'logs', emptyDir: {} },
       ],
     },
