@@ -14,6 +14,8 @@ import { getCapabilities } from './capabilities.js'
 
 export interface ManagerConfig {
   port: number
+  /** Deployment substrate, baked deterministically in configFromEnv — never a spawn-body field. */
+  substrate: 'isolated' | 'shared'
   sharedSupervisorUrl: string
   agentRunsNs: string
   logeImage: string
@@ -32,6 +34,10 @@ export function configFromEnv(env: NodeJS.ProcessEnv): ManagerConfig {
   if (!logeImage) throw new Error('LOGE_IMAGE is required (digest-pinned loge image)')
   return {
     port: Number(env.PORT ?? 8080),
+    // Baked deterministically, NOT from env: shared vs isolated provision differently (a shared
+    // pod+PVC vs per-conv loges), so switching is a deliberate code+deploy change — never a runtime
+    // knob, never a per-request payload. Today: isolated. Flip here to route to the shared pod.
+    substrate: 'isolated',
     sharedSupervisorUrl: env.SHARED_SUPERVISOR_URL ?? 'http://agent:8080',
     agentRunsNs: env.AGENT_RUNS_NS ?? 'agent-runs',
     logeImage,
@@ -225,17 +231,17 @@ export class Manager {
     }
   }
 
-  /** POST /sessions — routes by substrate, which is the manager's own concern (infra placement),
-   *  not the hub's: the hub sends none (agora ADR 0011 superseded), so an absent substrate takes
-   *  the manager's current default, `isolated` → get-or-create the conversation's loge. The
-   *  `shared` branch stays — substrate lives here and `shared` remains a value the manager
-   *  understands; its pod is undeployed today, so it's a latent capability, not dead code. */
+  /** POST /sessions — routes by substrate, which is the manager's own deployment config, NOT a
+   *  spawn-body field: shared and isolated provision differently (a shared pod+PVC vs a per-conv
+   *  loge), so which one is used is baked deterministically in configFromEnv (agora ADR 0011
+   *  superseded) — never a per-request payload. Today it is `isolated` → get-or-create the loge.
+   *  The `shared` branch stays: `shared` is a value the manager still understands; flip the baked
+   *  config to select it (a deliberate code+deploy change, its pod being undeployed today). */
   async spawn(body: Record<string, unknown>): Promise<{ status: number; body: unknown }> {
-    const substrate = (body.substrate as string | undefined) ?? 'isolated'
-    if (substrate !== 'shared' && substrate !== 'isolated') {
-      return { status: 400, body: { error: `invalid substrate: ${String(substrate)}` } }
-    }
-    const { substrate: _s, group: rawGroup, ...forwarded } = body
+    const substrate = this.deps.config.substrate
+    // Strip any legacy `substrate` a transitional hub might still send — it is NOT a routing input
+    // (routing is the baked config above); `group` is the only body field the manager consumes.
+    const { substrate: _legacy, group: rawGroup, ...forwarded } = body
 
     if (substrate === 'shared') {
       const result = await this.forwardSpawn(this.deps.config.sharedSupervisorUrl, forwarded)
