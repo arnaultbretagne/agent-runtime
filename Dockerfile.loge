@@ -27,6 +27,12 @@ COPY --from=channel --chown=node:node /opt/agora /opt/agora
 RUN claude plugin marketplace add /opt/agora \
  && claude plugin install agora@agora \
  && mv /home/node/.claude/plugins /home/node/agora-plugins
+# claude REWRITES ~/.claude.json on every run — the install above stripped the base's baked
+# onboarding/trust/bypass-acceptance flags (hasCompletedOnboarding, bypassPermissionsModeAccepted),
+# so a runtime claude would hang on the interactive "Bypass Permissions mode" prompt. Restore the
+# pristine seed. (Today's runtime-install loges dodge this only because the seed's mangling stays in
+# a separate initContainer overlay; baking it into the image makes it durable, so restore it.)
+COPY --chown=node:node image/claude.json.seed /home/node/.claude.json
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["node", "dist/index.js"]
