@@ -26,6 +26,10 @@ export interface ManagerConfig {
   anchorTtlDays: number
   sweepIntervalMs: number
   claudeOauthSecret: string
+  /** Port the inference-proxy listens on; loges reach it at http://<proxy-ip>:<proxyPort>. */
+  proxyPort: number
+  /** Account UUID the inference-proxy fills into the request body ('' → it resolves via profile). */
+  accountUuid: string
 }
 
 export function configFromEnv(env: NodeJS.ProcessEnv): ManagerConfig {
@@ -47,12 +51,24 @@ export function configFromEnv(env: NodeJS.ProcessEnv): ManagerConfig {
     anchorTtlDays: Number(env.ANCHOR_TTL_DAYS ?? 30),
     sweepIntervalMs: Number(env.SWEEP_INTERVAL_MS ?? 30_000),
     claudeOauthSecret: env.CLAUDE_OAUTH_SECRET ?? 'claude-oauth-token',
+    proxyPort: Number(env.PROXY_PORT ?? 8788),
+    accountUuid: env.ANTHROPIC_ACCOUNT_UUID ?? '',
   }
 }
 
+/** The loge's supervisor runs in subscription-LOGIN mode — enough for claude to emit the
+ *  `anthropic-beta: …,oauth-2025-04-20` capability the upstream requires — but with a WORTHLESS token.
+ *  The real one is injected by the inference-proxy. Any well-shaped `sk-ant-oat…` value works; this
+ *  one is unmistakably a placeholder so a leak is obviously inert. */
+const PLACEHOLDER_OAUTH_TOKEN =
+  'sk-ant-oat01-DISPOSSESSED-loge-holds-no-real-token-injected-by-inference-proxy-000000000000-AA'
+
+/** The singleton inference-proxy pod's name (agent-runs). The manager owns its lifecycle. */
+export const PROXY_POD_NAME = 'inference-proxy'
+
 /** The loge pod template (agent-runtime ADR 0010 §6 / infra-k8s ADR 0028 §3) — pinned here as the
  *  single source of truth; the plan's yaml is the spec this must match. */
-export function buildLogePodSpec(group: string, config: ManagerConfig): Record<string, unknown> {
+export function buildLogePodSpec(group: string, config: ManagerConfig, proxyBaseUrl: string): Record<string, unknown> {
   return {
     apiVersion: 'v1',
     kind: 'Pod',
@@ -109,10 +125,14 @@ export function buildLogePodSpec(group: string, config: ManagerConfig): Record<s
             { name: 'HOST', value: '0.0.0.0' },
             { name: 'RUNTIME_CWD', value: '/home/node/work' },
             { name: 'PTY_LOG_DIR', value: '/logs' },
-            {
-              name: 'CLAUDE_CODE_OAUTH_TOKEN',
-              valueFrom: { secretKeyRef: { name: config.claudeOauthSecret, key: 'token' } },
-            },
+            // Token dispossession (2026-07-09): the loge NEVER holds the real token. It runs in
+            // subscription-login mode with a worthless placeholder (so claude still emits the oauth
+            // beta header) and points ANTHROPIC_BASE_URL at the inference-proxy — the only holder of
+            // the real token, which swaps the Bearer + fills the account_uuid before forwarding to
+            // Anthropic. An untrusted loge holding the real token + egress is a walking exfil
+            // (CVE-2025-59536, a poisoned repo file suffices); here there is nothing to steal.
+            { name: 'CLAUDE_CODE_OAUTH_TOKEN', value: PLACEHOLDER_OAUTH_TOKEN },
+            { name: 'ANTHROPIC_BASE_URL', value: proxyBaseUrl },
             { name: 'DISABLE_AUTOUPDATER', value: '1' },
           ],
           securityContext: {
@@ -134,6 +154,48 @@ export function buildLogePodSpec(group: string, config: ManagerConfig): Record<s
       volumes: [
         { name: 'claude', emptyDir: { sizeLimit: '1Gi' } },
         { name: 'logs', emptyDir: {} },
+      ],
+    },
+  }
+}
+
+/** The inference-auth proxy pod: a standing singleton, SEPARATE from the loges, the ONLY holder of
+ *  the real token. The manager owns its lifecycle with the pod-CRUD it already has (agent-runs), so
+ *  the whole feature lives in agent-runtime — no infra-k8s Deployment/Service. It is trusted (no
+ *  gVisor) and a different pod from any loge, so a compromised loge cannot read its token (pod
+ *  isolation); the loge reaches it only over HTTP. Runs the loge image (which is FROM the base
+ *  agent-runtime image → carries dist/inference-proxy.js) via a CMD override, keeping the tini
+ *  entrypoint. Resources are tiny; note it consumes one of the agent-runs pod-quota slots. */
+export function buildProxyPodSpec(config: ManagerConfig): Record<string, unknown> {
+  return {
+    apiVersion: 'v1',
+    kind: 'Pod',
+    metadata: { name: PROXY_POD_NAME, labels: { app: 'inference-proxy' } },
+    spec: {
+      restartPolicy: 'Always', // standing service — the kubelet restarts the container on a crash
+      automountServiceAccountToken: false,
+      securityContext: { fsGroup: 1000, seccompProfile: { type: 'RuntimeDefault' }, runAsNonRoot: true, runAsUser: 1000 },
+      containers: [
+        {
+          name: 'proxy',
+          image: config.logeImage,
+          // keep the image's tini entrypoint, override its CMD (WORKDIR /app carries dist/)
+          args: ['node', 'dist/inference-proxy.js'],
+          ports: [{ containerPort: config.proxyPort }],
+          env: [
+            { name: 'PORT', value: String(config.proxyPort) },
+            // the REAL token — it lives ONLY here, never in a loge
+            {
+              name: 'CLAUDE_CODE_OAUTH_TOKEN',
+              valueFrom: { secretKeyRef: { name: config.claudeOauthSecret, key: 'token' } },
+            },
+            { name: 'ANTHROPIC_ACCOUNT_UUID', value: config.accountUuid },
+            { name: 'UPSTREAM_ORIGIN', value: 'https://api.anthropic.com' },
+          ],
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ['ALL'] }, runAsNonRoot: true },
+          resources: { requests: { cpu: '25m', memory: '64Mi' }, limits: { cpu: '250m', memory: '256Mi' } },
+          readinessProbe: { httpGet: { path: '/healthz', port: config.proxyPort }, periodSeconds: 2 },
+        },
       ],
     },
   }
@@ -340,10 +402,15 @@ export class Manager {
       this.loges.delete(group) // stale entry (pod gone/unready) — fall through and recreate
     }
 
+    // The loge is dispossessed — it can only reach Anthropic through the inference-proxy. Ensure the
+    // singleton proxy is up first and hand the loge its address; without it a loge could not infer.
+    const proxyBaseUrl = await this.ensureProxyBaseUrl()
+    if (!proxyBaseUrl) return { error: 'quota_exceeded' }
+
     await this.createGate.acquire()
     try {
       const podName = `loge-${group}`
-      const spec = buildLogePodSpec(group, this.deps.config)
+      const spec = buildLogePodSpec(group, this.deps.config, proxyBaseUrl)
       let pod: any
       try {
         pod = await this.deps.k8s.createPod(spec)
@@ -370,6 +437,37 @@ export class Manager {
     } finally {
       this.createGate.release()
     }
+  }
+
+  /** Ensure the singleton inference-proxy pod is up (the manager owns its lifecycle like a loge:
+   *  get-or-create + waitReady), returning its base-URL — or undefined if it can't be readied.
+   *  Called before every loge create (the loge is dispossessed, so it depends on the proxy) and once
+   *  at boot. Recreates the pod if it vanished/terminated; restartPolicy:Always covers plain crashes. */
+  private async ensureProxyBaseUrl(): Promise<string | undefined> {
+    const pod = await this.deps.k8s.getPod(PROXY_POD_NAME)
+    const phase = pod?.status?.phase
+    if (!pod || phase === 'Failed' || phase === 'Succeeded') {
+      if (pod) await this.deps.k8s.deletePod(PROXY_POD_NAME).catch(() => {})
+      try {
+        await this.deps.k8s.createPod(buildProxyPodSpec(this.deps.config))
+      } catch (err) {
+        if ((err as HttpError).status !== 409) {
+          console.error('[manager] inference-proxy create failed:', (err as HttpError).status, (err as Error).message, (err as HttpError).body)
+          return undefined
+        }
+      }
+    }
+    const ready = await this.waitReady(PROXY_POD_NAME)
+    if (!ready?.status?.podIP) {
+      console.error('[manager] inference-proxy never became Ready')
+      return undefined
+    }
+    return `http://${ready.status.podIP}:${this.deps.config.proxyPort}`
+  }
+
+  /** Ensure the inference-proxy is up — public wrapper for the boot path. */
+  async ensureProxy(): Promise<void> {
+    await this.ensureProxyBaseUrl()
   }
 
   private async waitReady(podName: string): Promise<any | undefined> {
@@ -714,6 +812,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const config = configFromEnv(process.env)
   const manager = new Manager({ k8s: new K8sClient(config.agentRunsNs), config })
   await manager.bootReconcile()
+  await manager.ensureProxy().catch((e) => console.error('[manager] initial inference-proxy ensure failed:', e))
   setInterval(() => manager.sweepOnce().catch((e) => console.error('[manager] sweep failed:', e)), config.sweepIntervalMs).unref()
   createManagerServer(manager).listen(config.port, '0.0.0.0', () => {
     console.log(`[manager] listening on 0.0.0.0:${config.port}`)
