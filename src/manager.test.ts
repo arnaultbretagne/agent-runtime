@@ -422,6 +422,6 @@ test('token dispossession: the loge holds a placeholder + proxy base-URL (never 
   const proxyOauth = proxyEnv.find((e) => e.name === 'CLAUDE_CODE_OAUTH_TOKEN')!
   assert.equal(proxyOauth.valueFrom?.secretKeyRef?.name, config.claudeOauthSecret, 'the REAL token lives ONLY in the proxy pod')
   assert.equal(proxyOauth.value, undefined)
-  assert.equal(proxySpec.spec.runtimeClassName, undefined, 'the trusted proxy is not gVisor-sandboxed (unlike a loge)')
+  assert.equal(proxySpec.spec.runtimeClassName, 'sandboxed', 'agent-runs mandates gVisor for ALL pods (ADR 0027) — the proxy is sandboxed too')
   assert.equal(proxySpec.spec.containers[0].args?.join(' '), 'node dist/inference-proxy.js')
 })

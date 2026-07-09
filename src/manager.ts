@@ -161,9 +161,11 @@ export function buildLogePodSpec(group: string, config: ManagerConfig, proxyBase
 
 /** The inference-auth proxy pod: a standing singleton, SEPARATE from the loges, the ONLY holder of
  *  the real token. The manager owns its lifecycle with the pod-CRUD it already has (agent-runs), so
- *  the whole feature lives in agent-runtime — no infra-k8s Deployment/Service. It is trusted (no
- *  gVisor) and a different pod from any loge, so a compromised loge cannot read its token (pod
- *  isolation); the loge reaches it only over HTTP. Runs the loge image (which is FROM the base
+ *  the whole feature lives in agent-runtime — no infra-k8s Deployment/Service. It is a different pod
+ *  from any loge, so a compromised loge cannot read its token (pod isolation) — it only reaches the
+ *  proxy over HTTP. It runs gVisor-sandboxed too: agent-runs' admission policy (ADR 0027) mandates
+ *  runtimeClassName: sandboxed for EVERY pod; harmless (gVisor is host-isolation, orthogonal to the
+ *  token custody that pod isolation already gives). Runs the loge image (which is FROM the base
  *  agent-runtime image → carries dist/inference-proxy.js) via a CMD override, keeping the tini
  *  entrypoint. Resources are tiny; note it consumes one of the agent-runs pod-quota slots. */
 export function buildProxyPodSpec(config: ManagerConfig): Record<string, unknown> {
@@ -172,6 +174,8 @@ export function buildProxyPodSpec(config: ManagerConfig): Record<string, unknown
     kind: 'Pod',
     metadata: { name: PROXY_POD_NAME, labels: { app: 'inference-proxy' } },
     spec: {
+      // agent-runs mandates gVisor for EVERY pod (ADR 0027 admission policy) — sandbox the proxy too.
+      runtimeClassName: 'sandboxed',
       restartPolicy: 'Always', // standing service — the kubelet restarts the container on a crash
       automountServiceAccountToken: false,
       securityContext: { fsGroup: 1000, seccompProfile: { type: 'RuntimeDefault' }, runAsNonRoot: true, runAsUser: 1000 },
