@@ -4,7 +4,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Manager, CreateGate, type ManagerConfig } from './manager.js'
+import { Manager, CreateGate, buildLogePodSpec, buildProxyPodSpec, type ManagerConfig } from './manager.js'
 import type { K8sPods, HttpError } from './k8s.js'
 
 function sleep(ms: number): Promise<void> {
@@ -25,6 +25,8 @@ function baseConfig(overrides: Partial<ManagerConfig> = {}): ManagerConfig {
     anchorTtlDays: 30,
     sweepIntervalMs: 30_000,
     claudeOauthSecret: 'claude-oauth-token',
+    proxyPort: 8788,
+    accountUuid: 'acc-uuid-test',
     ...overrides,
   }
 }
@@ -159,7 +161,7 @@ test('spawn: creates a loge from baked config, with no substrate in the body (th
     assert.equal(result.status, 202)
     assert.deepEqual(result.body, { id: 'r-iso', status: 'creating' }, 'read-driven: accepted + booting, a fact — not a blocked call')
     await manager.awaitSettled()
-    assert.equal(k8s.createCalls, 1, 'absent substrate must create a loge, never proxy to the dead shared pod')
+    assert.equal(k8s.createCalls, 2, 'the inference-proxy singleton + the loge (absent substrate must create a loge, never proxy to the dead shared pod)')
   } finally {
     await loge.close()
   }
@@ -180,7 +182,7 @@ test('spawn: isolated substrate creates a loge once, reuses it for the same grou
     await manager.awaitSettled()
     assert.equal(r1.status, 202)
     assert.equal(r2.status, 202)
-    assert.equal(k8s.createCalls, 1, 'the second spawn for the same group must reuse the loge')
+    assert.equal(k8s.createCalls, 2, 'inference-proxy + loge created once; the second spawn reuses the loge (no new create)')
   } finally {
     await loge.close()
   }
@@ -276,7 +278,7 @@ test('resume resolution: missing everywhere -> exited{anchor_transcript_missing}
     assert.equal(got.status, 200)
     assert.equal((got.body as any).status, 'exited')
     assert.equal((got.body as any).reason, 'anchor_transcript_missing', 'the hub maps this to its one-shot forceFresh')
-    assert.equal(k8s.pods.size, 1, 'the loge itself is not torn down — the retry (forceFresh) reuses it')
+    assert.equal(k8s.pods.has('loge-conv-4'), true, 'the loge itself is not torn down — the retry (forceFresh) reuses it')
   } finally {
     await loge.close()
     rmSync(anchorDir, { recursive: true, force: true })
@@ -400,4 +402,26 @@ test('deleteAnchor: removes the file; absent file is still a no-op success', asy
   } finally {
     rmSync(anchorDir, { recursive: true, force: true })
   }
+})
+
+test('token dispossession: the loge holds a placeholder + proxy base-URL (never the secret); the proxy holds the real secret', () => {
+  const config = baseConfig()
+  const logeSpec = buildLogePodSpec('conv-z', config, 'http://10.0.0.9:8788') as any
+  const logeEnv = logeSpec.spec.containers[0].env as Array<{ name: string; value?: string; valueFrom?: unknown }>
+  const logeOauth = logeEnv.find((e) => e.name === 'CLAUDE_CODE_OAUTH_TOKEN')!
+  assert.equal(logeOauth.valueFrom, undefined, 'the loge must NOT mount the real token secret')
+  assert.match(logeOauth.value ?? '', /^sk-ant-oat01-DISPOSSESSED/, 'the loge gets a worthless placeholder')
+  assert.equal(
+    logeEnv.find((e) => e.name === 'ANTHROPIC_BASE_URL')?.value,
+    'http://10.0.0.9:8788',
+    'the loge is pointed at the inference-proxy',
+  )
+
+  const proxySpec = buildProxyPodSpec(config) as any
+  const proxyEnv = proxySpec.spec.containers[0].env as Array<{ name: string; value?: string; valueFrom?: any }>
+  const proxyOauth = proxyEnv.find((e) => e.name === 'CLAUDE_CODE_OAUTH_TOKEN')!
+  assert.equal(proxyOauth.valueFrom?.secretKeyRef?.name, config.claudeOauthSecret, 'the REAL token lives ONLY in the proxy pod')
+  assert.equal(proxyOauth.value, undefined)
+  assert.equal(proxySpec.spec.runtimeClassName, undefined, 'the trusted proxy is not gVisor-sandboxed (unlike a loge)')
+  assert.equal(proxySpec.spec.containers[0].args?.join(' '), 'node dist/inference-proxy.js')
 })
