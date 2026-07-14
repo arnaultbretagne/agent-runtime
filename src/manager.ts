@@ -30,6 +30,12 @@ export interface ManagerConfig {
   proxyPort: number
   /** Account UUID the inference-proxy fills into the request body ('' → it resolves via profile). */
   accountUuid: string
+  /** Broker migration (P3): when true, a new loge gets a per-loge broker LEASE (not the inference-proxy
+   *  placeholder) and points at the broker data plane. The proxy path stays for old loges + rollback
+   *  (flip this off). */
+  useBroker: boolean
+  brokerAdminUrl: string
+  brokerDataUrl: string
 }
 
 export function configFromEnv(env: NodeJS.ProcessEnv): ManagerConfig {
@@ -53,6 +59,9 @@ export function configFromEnv(env: NodeJS.ProcessEnv): ManagerConfig {
     claudeOauthSecret: env.CLAUDE_OAUTH_SECRET ?? 'claude-oauth-token',
     proxyPort: Number(env.PROXY_PORT ?? 8788),
     accountUuid: env.ANTHROPIC_ACCOUNT_UUID ?? '',
+    useBroker: env.USE_BROKER === 'true',
+    brokerAdminUrl: env.BROKER_ADMIN_URL ?? 'http://agent-broker.agent.svc.cluster.local:8789',
+    brokerDataUrl: env.BROKER_DATA_URL ?? 'http://agent-broker.agent.svc.cluster.local:8788',
   }
 }
 
@@ -68,7 +77,7 @@ export const PROXY_POD_NAME = 'inference-proxy'
 
 /** The loge pod template (agent-runtime ADR 0010 §6 / infra-k8s ADR 0028 §3) — pinned here as the
  *  single source of truth; the plan's yaml is the spec this must match. */
-export function buildLogePodSpec(group: string, config: ManagerConfig, proxyBaseUrl: string): Record<string, unknown> {
+export function buildLogePodSpec(group: string, config: ManagerConfig, oauthToken: string, baseUrl: string): Record<string, unknown> {
   return {
     apiVersion: 'v1',
     kind: 'Pod',
@@ -125,14 +134,14 @@ export function buildLogePodSpec(group: string, config: ManagerConfig, proxyBase
             { name: 'HOST', value: '0.0.0.0' },
             { name: 'RUNTIME_CWD', value: '/home/node/work' },
             { name: 'PTY_LOG_DIR', value: '/logs' },
-            // Token dispossession (2026-07-09): the loge NEVER holds the real token. It runs in
-            // subscription-login mode with a worthless placeholder (so claude still emits the oauth
-            // beta header) and points ANTHROPIC_BASE_URL at the inference-proxy — the only holder of
-            // the real token, which swaps the Bearer + fills the account_uuid before forwarding to
-            // Anthropic. An untrusted loge holding the real token + egress is a walking exfil
-            // (CVE-2025-59536, a poisoned repo file suffices); here there is nothing to steal.
-            { name: 'CLAUDE_CODE_OAUTH_TOKEN', value: PLACEHOLDER_OAUTH_TOKEN },
-            { name: 'ANTHROPIC_BASE_URL', value: proxyBaseUrl },
+            // Token dispossession (2026-07-09): the loge NEVER holds the real token — it holds a
+            // worthless bearer (so claude still emits the oauth beta header) and points
+            // ANTHROPIC_BASE_URL at a trusted egress that swaps in the real token + fills account_uuid.
+            // Two shapes (P3): the inference-proxy placeholder + the proxy IP, OR an opaque broker
+            // LEASE + the broker data plane (the broker validates the lease and forwards to the
+            // isolated claude-adapter). Either way the loge has nothing worth stealing.
+            { name: 'CLAUDE_CODE_OAUTH_TOKEN', value: oauthToken },
+            { name: 'ANTHROPIC_BASE_URL', value: baseUrl },
             { name: 'DISABLE_AUTOUPDATER', value: '1' },
           ],
           securityContext: {
@@ -212,6 +221,9 @@ const EXITED_TOMBSTONE_MS = 60_000
 interface LogeEntry {
   podName: string
   lastEmptyAt?: number
+  /** The broker lease minted for this loge (P3, broker mode) — revoked when the loge is torn down.
+   *  Only the leaseId is tracked (never the token); undefined on the inference-proxy path. */
+  leaseId?: string
 }
 
 type RunLocation = { where: 'shared' } | { where: 'loge'; podName: string; group: string }
@@ -403,18 +415,34 @@ export class Manager {
       const pod = await this.deps.k8s.getPod(existing.podName)
       const ip = pod?.status?.podIP
       if (pod && ip && this.isReady(pod)) return { podName: existing.podName, podIp: ip }
-      this.loges.delete(group) // stale entry (pod gone/unready) — fall through and recreate
+      await this.revokeLease(existing.leaseId) // stale entry — its lease dies with it
+      this.loges.delete(group) // (pod gone/unready) — fall through and recreate
     }
 
-    // The loge is dispossessed — it can only reach Anthropic through the inference-proxy. Ensure the
-    // singleton proxy is up first and hand the loge its address; without it a loge could not infer.
-    const proxyBaseUrl = await this.ensureProxyBaseUrl()
-    if (!proxyBaseUrl) return { error: 'quota_exceeded' }
+    // The loge is dispossessed — it reaches Anthropic only through a trusted egress that holds the real
+    // token. P3: the inference-proxy (placeholder) OR the broker (a per-loge lease + the broker data
+    // plane, which validates the lease and forwards to the isolated claude-adapter). USE_BROKER flips
+    // new loges to the broker; old loges + rollback keep the proxy.
+    let oauthToken: string
+    let baseUrl: string
+    let leaseId: string | undefined
+    if (this.deps.config.useBroker) {
+      const lease = await this.mintLease(group)
+      if (!lease) return { error: 'quota_exceeded' } // broker unreachable → provision failure (rollback: USE_BROKER=false)
+      oauthToken = lease.token
+      baseUrl = this.deps.config.brokerDataUrl
+      leaseId = lease.leaseId
+    } else {
+      const proxyBaseUrl = await this.ensureProxyBaseUrl()
+      if (!proxyBaseUrl) return { error: 'quota_exceeded' }
+      oauthToken = PLACEHOLDER_OAUTH_TOKEN
+      baseUrl = proxyBaseUrl
+    }
 
     await this.createGate.acquire()
     try {
       const podName = `loge-${group}`
-      const spec = buildLogePodSpec(group, this.deps.config, proxyBaseUrl)
+      const spec = buildLogePodSpec(group, this.deps.config, oauthToken, baseUrl)
       let pod: any
       try {
         pod = await this.deps.k8s.createPod(spec)
@@ -427,6 +455,7 @@ export class Manager {
           // namespace which had no PSA). quota_exceeded is still the contract (ADR 0010 §1.1 —
           // any pod-creation failure buckets here), but the operator needs the real cause logged.
           console.error(`[manager] createPod failed for ${podName}:`, (err as HttpError).status, (err as Error).message, (err as HttpError).body)
+          await this.revokeLease(leaseId) // the loge won't exist — don't leave its lease dangling
           return { error: 'quota_exceeded' }
         }
       }
@@ -434,9 +463,10 @@ export class Manager {
       if (!ready) {
         console.error(`[manager] ${podName} never became Ready within logeReadyTimeoutMs`)
         await this.deps.k8s.deletePod(podName).catch(() => {})
+        await this.revokeLease(leaseId)
         return { error: 'quota_exceeded' }
       }
-      this.loges.set(group, { podName })
+      this.loges.set(group, { podName, leaseId })
       return { podName, podIp: ready.status.podIP }
     } finally {
       this.createGate.release()
@@ -474,6 +504,43 @@ export class Manager {
     await this.ensureProxyBaseUrl()
   }
 
+  /** Mint a per-loge broker lease (P3, broker mode). `chat-v1` is the only enabled profile until P4
+   *  wires the run's real equipment (agora ADR 0012). Returns undefined if the broker admin plane is
+   *  unreachable — the caller treats that as a provision failure (rollback: USE_BROKER=false). */
+  private async mintLease(group: string): Promise<{ leaseId: string; token: string } | undefined> {
+    try {
+      const res = await fetch(`${this.deps.config.brokerAdminUrl}/v1/leases`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ runId: group, profile: 'chat-v1' }),
+        signal: AbortSignal.timeout(3000),
+      })
+      if (!res.ok) {
+        console.error('[manager] lease mint failed:', res.status)
+        return undefined
+      }
+      const j = (await res.json()) as { leaseId?: string; token?: string }
+      return j.leaseId && j.token ? { leaseId: j.leaseId, token: j.token } : undefined
+    } catch (e) {
+      console.error('[manager] lease mint error:', (e as Error).message)
+      return undefined
+    }
+  }
+
+  /** Revoke a lease (idempotent, best-effort — the lease TTL is the backstop). Only ever the leaseId
+   *  in a log, never the token. */
+  private async revokeLease(leaseId: string | undefined): Promise<void> {
+    if (!leaseId) return
+    try {
+      await fetch(`${this.deps.config.brokerAdminUrl}/v1/leases/${encodeURIComponent(leaseId)}`, {
+        method: 'DELETE',
+        signal: AbortSignal.timeout(3000),
+      })
+    } catch {
+      /* best-effort */
+    }
+  }
+
   private async waitReady(podName: string): Promise<any | undefined> {
     const deadline = Date.now() + this.deps.config.logeReadyTimeoutMs
     for (;;) {
@@ -495,6 +562,7 @@ export class Manager {
     for (const [group, loge] of [...this.loges]) {
       const pod = await this.deps.k8s.getPod(loge.podName)
       if (!pod) {
+        await this.revokeLease(loge.leaseId)
         this.loges.delete(group)
         continue
       }
@@ -503,6 +571,7 @@ export class Manager {
         this.tombstoneRunsFor(loge.podName, this.extractExitCode(pod), now)
         await this.deps.k8s.deletePod(loge.podName).catch(() => {})
         this.forgetRunsFor(loge.podName)
+        await this.revokeLease(loge.leaseId)
         this.loges.delete(group)
         continue
       }
@@ -511,6 +580,7 @@ export class Manager {
         if (now - createdAt > this.deps.config.logeReadyTimeoutMs) {
           await this.deps.k8s.deletePod(loge.podName).catch(() => {})
           this.forgetRunsFor(loge.podName)
+          await this.revokeLease(loge.leaseId)
           this.loges.delete(group)
         }
         continue
@@ -532,6 +602,7 @@ export class Manager {
           await this.drainLoge(loge.podName, podIp)
           await this.deps.k8s.deletePod(loge.podName).catch(() => {})
           this.forgetRunsFor(loge.podName)
+          await this.revokeLease(loge.leaseId)
           this.loges.delete(group)
         }
       } else {
