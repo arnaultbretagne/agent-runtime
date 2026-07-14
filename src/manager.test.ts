@@ -27,6 +27,9 @@ function baseConfig(overrides: Partial<ManagerConfig> = {}): ManagerConfig {
     claudeOauthSecret: 'claude-oauth-token',
     proxyPort: 8788,
     accountUuid: 'acc-uuid-test',
+    useBroker: false,
+    brokerAdminUrl: 'http://127.0.0.1:1',
+    brokerDataUrl: 'http://127.0.0.1:1',
     ...overrides,
   }
 }
@@ -406,7 +409,7 @@ test('deleteAnchor: removes the file; absent file is still a no-op success', asy
 
 test('token dispossession: the loge holds a placeholder + proxy base-URL (never the secret); the proxy holds the real secret', () => {
   const config = baseConfig()
-  const logeSpec = buildLogePodSpec('conv-z', config, 'http://10.0.0.9:8788') as any
+  const logeSpec = buildLogePodSpec('conv-z', config, 'sk-ant-oat01-DISPOSSESSED-test', 'http://10.0.0.9:8788') as any
   const logeEnv = logeSpec.spec.containers[0].env as Array<{ name: string; value?: string; valueFrom?: unknown }>
   const logeOauth = logeEnv.find((e) => e.name === 'CLAUDE_CODE_OAUTH_TOKEN')!
   assert.equal(logeOauth.valueFrom, undefined, 'the loge must NOT mount the real token secret')
@@ -424,4 +427,14 @@ test('token dispossession: the loge holds a placeholder + proxy base-URL (never 
   assert.equal(proxyOauth.value, undefined)
   assert.equal(proxySpec.spec.runtimeClassName, 'sandboxed', 'agent-runs mandates gVisor for ALL pods (ADR 0027) — the proxy is sandboxed too')
   assert.equal(proxySpec.spec.containers[0].args?.join(' '), 'node dist/inference-proxy.js')
+})
+
+test('broker mode (P3): the loge holds an opaque LEASE + the broker data plane, still never the real secret', () => {
+  const config = baseConfig({ useBroker: true, brokerDataUrl: 'http://agent-broker.agent.svc:8788' })
+  const spec = buildLogePodSpec('conv-b', config, 'sk-ant-oat01-broker-LEASE123', 'http://agent-broker.agent.svc:8788') as any
+  const env = spec.spec.containers[0].env as Array<{ name: string; value?: string; valueFrom?: unknown }>
+  const oauth = env.find((e) => e.name === 'CLAUDE_CODE_OAUTH_TOKEN')!
+  assert.equal(oauth.valueFrom, undefined, 'still no real-secret mount in the loge')
+  assert.equal(oauth.value, 'sk-ant-oat01-broker-LEASE123', 'the loge holds the opaque lease, not the real token')
+  assert.equal(env.find((e) => e.name === 'ANTHROPIC_BASE_URL')?.value, 'http://agent-broker.agent.svc:8788', 'pointed at the broker data plane')
 })
