@@ -11,7 +11,7 @@
     "start:manager": "node dist/manager.js",
     "dev": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test src/*.test.ts"
+    "test": "tsx --test src/*.test.ts src/broker/*.test.ts"
   },
   "dependencies": {
     "node-pty": "^1.0.0"
