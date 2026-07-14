@@ -5,6 +5,8 @@
 Accepted — 2026-07-05 (verrous V1–V3 passés — voir RUNLOG `/srv/runtime-isolation-plan.RUNLOG.md`).
 **Amended 2026-07-07** — read-driven liveness: the manager reports a `creating` status so the hub
 *reads* boot as a fact instead of *guessing* it via a settle window. See the amendment at the end.
+**Amended 2026-07-14** — §6/§7 credential custody is superseded by **ADR 0011** (the agent credential
+broker): a loge carries an opaque per-run lease, not `CLAUDE_CODE_OAUTH_TOKEN` or any provider secret.
 **Extends ADR 0001** (the supervisor stays a thin process manager — a *manager* appears above it),
 **ADR 0003** (the pod boundary generalises to per-conversation pods) and **ADR 0004** (one image, two
 entrypoints). Leaves **ADR 0008** untouched (the idle clock still lives with the session).
