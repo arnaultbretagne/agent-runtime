@@ -14,9 +14,10 @@
  * GitHub lets you narrow, never widen. So the ceiling is Arnault's App; the narrowing is ours.
  *
  * The honest asymmetry vs the vault: git's HTTPS client needs a real credential, so this token DOES
- * enter the loge. It is bounded to ~1h, the profile's permissions, and (for write) a repo set that
- * excludes infra-k8s. A compromised loge can use it for that hour — which is exactly why the
- * ruleset, not this file, is what keeps it to "propose".
+ * enter the loge (via the P6.4 credential helper, which at least keeps it off disk and out of argv).
+ * It is bounded by the profile's permissions and the hour it lives — and by nothing else: there is
+ * no repo scope and no deny-list, infra-k8s included. A compromised loge can use it for that hour,
+ * which is exactly why the ruleset, not this file, is what keeps it to "propose".
  *
  * Nothing here logs a token, a JWT, or the key.
  */

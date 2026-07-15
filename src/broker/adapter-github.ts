@@ -12,12 +12,12 @@
  *   github:contents:write     -> {contents: write, pull_requests: write, metadata: read}
  *                                on ALL installed repos, infra-k8s included
  *
- * No per-run repo target. Scoping READ buys nothing (the repos are public, and a loge has no
- * internet — the broker is already the only door), and scoping WRITE buys nothing either: GitHub has
- * no permission separating "push a branch" from "push main" (proven — `contents: write` reaches the
- * default branch, and without it an agent cannot even branch). The line between proposing and
- * disposing is drawn by the repository RULESET. A repo scope would only have broken the real
- * workflow, where one change spans several repos at once.
+ * No per-run repo target. Scoping READ buys nothing — the repos are public and a loge has world
+ * egress on 443, so it can clone them token-free regardless. Scoping WRITE buys nothing either:
+ * GitHub has no permission separating "push a branch" from "push main" (proven — `contents: write`
+ * reaches the default branch, and without it an agent cannot even branch). The line between
+ * proposing and disposing is drawn by the repository RULESET. A repo scope would only have broken
+ * the real workflow, where one change spans several repos at once.
  *
  * And no deny-list, infra-k8s included: with the ruleset active, excluding it would only stop an
  * agent OPENING a PR — noise, not compromise — while barring it from the infra work that is most of

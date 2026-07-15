@@ -37,5 +37,32 @@ RUN claude plugin marketplace add /opt/agora \
 # a separate initContainer overlay; baking it into the image makes it durable, so restore it.)
 COPY --chown=node:node image/claude.json.seed /home/node/.claude.json
 
+# --- GitHub access without a stored credential (agent-broker plan P6.4) --------------------------
+# git's HTTPS client needs a real credential, so — unlike the vault, which the broker proxies — a
+# GitHub token does enter the loge. It enters through here and nowhere else: a credential helper that
+# asks the broker per call and answers git on a pipe. Nothing is stored, so nothing leaks into the
+# session transcript, the PTY log, `.git/config`, or a remote URL.
+#
+# Root only to write outside /home/node; back to `node` immediately (skip-permissions needs non-root).
+USER root
+COPY --chmod=0755 image/git-credential-agent-broker /usr/local/bin/git-credential-agent-broker
+# Two facts, both --system (/etc/gitconfig) rather than --global: they are properties of the image,
+# not preferences of a user.
+#
+# 1. The helper, SCOPED to https://github.com on purpose. An unscoped `credential.helper` makes git
+#    offer it to every host it is pointed at — including whatever URL a cloned repo names in its
+#    .gitmodules, which is an attacker-chosen string. The helper refuses non-GitHub hosts on its own
+#    too; both layers are proven in git-credential.test.ts, one by driving real git. This is the
+#    outer of the two.
+# 2. An identity, because git refuses to guess one and an agent that cannot commit cannot open the PR
+#    that repo-dev-v1 exists for. This is the App's own bot account (`gh api /users/k8s-broker[bot]`
+#    -> id 305576643): a commit an agent pushes is then attributed to the broker's App and linked to
+#    that bot by GitHub, not to Arnault. It is a display string — nothing authenticates against it —
+#    so if the App is ever replaced, correcting it here is the whole change.
+RUN git config --system credential."https://github.com".helper agent-broker \
+ && git config --system user.name 'k8s-broker[bot]' \
+ && git config --system user.email '305576643+k8s-broker[bot]@users.noreply.github.com'
+USER node
+
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["node", "dist/index.js"]
