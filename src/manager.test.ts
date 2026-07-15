@@ -4,7 +4,16 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Manager, CreateGate, buildLogePodSpec, buildProxyPodSpec, type ManagerConfig } from './manager.js'
+import {
+  Manager,
+  CreateGate,
+  buildLogePodSpec,
+  buildProxyPodSpec,
+  equipmentFromPod,
+  sameEquipment,
+  stripMintedEnv,
+  type ManagerConfig,
+} from './manager.js'
 import type { K8sPods, HttpError } from './k8s.js'
 
 function sleep(ms: number): Promise<void> {
@@ -94,6 +103,14 @@ class MockK8s implements K8sPods {
       throw err
     }
     const pod = this.makePod(name)
+    // A real API server echoes back the metadata it was sent. Keep the SPEC's labels/annotations so a
+    // test reads what the manager actually asked for, not what the fixture invented.
+    pod.metadata = {
+      ...pod.metadata,
+      ...spec.metadata,
+      labels: { ...pod.metadata?.labels, ...spec.metadata?.labels },
+      annotations: { ...pod.metadata?.annotations, ...spec.metadata?.annotations },
+    }
     this.pods.set(name, pod)
     return pod
   }
@@ -409,7 +426,11 @@ test('deleteAnchor: removes the file; absent file is still a no-op success', asy
 
 test('token dispossession: the loge holds a placeholder + proxy base-URL (never the secret); the proxy holds the real secret', () => {
   const config = baseConfig()
-  const logeSpec = buildLogePodSpec('conv-z', config, 'sk-ant-oat01-DISPOSSESSED-test', 'http://10.0.0.9:8788') as any
+  const logeSpec = buildLogePodSpec('conv-z', config, {
+    oauthToken: 'sk-ant-oat01-DISPOSSESSED-test',
+    baseUrl: 'http://10.0.0.9:8788',
+    equipment: { profile: 'chat-v1', target: null },
+  }) as any
   const logeEnv = logeSpec.spec.containers[0].env as Array<{ name: string; value?: string; valueFrom?: unknown }>
   const logeOauth = logeEnv.find((e) => e.name === 'CLAUDE_CODE_OAUTH_TOKEN')!
   assert.equal(logeOauth.valueFrom, undefined, 'the loge must NOT mount the real token secret')
@@ -431,10 +452,173 @@ test('token dispossession: the loge holds a placeholder + proxy base-URL (never 
 
 test('broker mode (P3): the loge holds an opaque LEASE + the broker data plane, still never the real secret', () => {
   const config = baseConfig({ useBroker: true, brokerDataUrl: 'http://agent-broker.agent.svc:8788' })
-  const spec = buildLogePodSpec('conv-b', config, 'sk-ant-oat01-broker-LEASE123', 'http://agent-broker.agent.svc:8788') as any
+  const spec = buildLogePodSpec('conv-b', config, {
+    oauthToken: 'sk-ant-oat01-broker-LEASE123',
+    baseUrl: 'http://agent-broker.agent.svc:8788',
+    equipment: { profile: 'chat-v1', target: null },
+    leaseId: 'lease_abc123',
+  }) as any
   const env = spec.spec.containers[0].env as Array<{ name: string; value?: string; valueFrom?: unknown }>
   const oauth = env.find((e) => e.name === 'CLAUDE_CODE_OAUTH_TOKEN')!
   assert.equal(oauth.valueFrom, undefined, 'still no real-secret mount in the loge')
   assert.equal(oauth.value, 'sk-ant-oat01-broker-LEASE123', 'the loge holds the opaque lease, not the real token')
   assert.equal(env.find((e) => e.name === 'ANTHROPIC_BASE_URL')?.value, 'http://agent-broker.agent.svc:8788', 'pointed at the broker data plane')
+})
+
+/* ---------------------------------------------------------------- *
+ *  P4 — equipment (agora ADR 0012)                                  *
+ * ---------------------------------------------------------------- */
+
+test('equipment rides on the loge pod: profile as a label, target/leaseId as annotations, never the token', () => {
+  const spec = buildLogePodSpec('conv-e', baseConfig({ useBroker: true }), {
+    oauthToken: 'sk-ant-oat01-broker-SECRETLEASE',
+    baseUrl: 'http://broker:8788',
+    equipment: { profile: 'repo-read-v1', target: 'github:arnaultbretagne/agora' },
+    leaseId: 'lease_xyz',
+  }) as any
+  assert.equal(spec.metadata.labels['agora.bretagne.dev/profile'], 'repo-read-v1')
+  assert.equal(spec.metadata.annotations['agora.bretagne.dev/target'], 'github:arnaultbretagne/agora')
+  assert.equal(spec.metadata.annotations['agora.bretagne.dev/lease-id'], 'lease_xyz')
+  // The pod's metadata is world-readable to anyone with pod-read in agent-runs. Only the leaseId may
+  // appear there (plan §2.6) — never the bearer itself.
+  assert.equal(JSON.stringify(spec.metadata).includes('SECRETLEASE'), false)
+})
+
+test('equipmentFromPod: a pre-P4 loge (no label) reads back as chat-v1 — the upgrade adopts it, never churns it', () => {
+  assert.deepEqual(equipmentFromPod(readyLoge('loge-old', 'g-old', '127.0.0.1')), { profile: 'chat-v1', target: null })
+  const equipped = {
+    metadata: {
+      labels: { 'agora.bretagne.dev/profile': 'repo-read-v1' },
+      annotations: { 'agora.bretagne.dev/target': 'github:arnaultbretagne/agora' },
+    },
+  }
+  assert.deepEqual(equipmentFromPod(equipped), { profile: 'repo-read-v1', target: 'github:arnaultbretagne/agora' })
+})
+
+test('sameEquipment: profile AND target both matter; absent and null target are the same thing', () => {
+  const t = 'github:arnaultbretagne/agora'
+  assert.equal(sameEquipment({ profile: 'chat-v1', target: null }, { profile: 'chat-v1', target: null }), true)
+  assert.equal(sameEquipment({ profile: 'chat-v1', target: null }, { profile: 'vault-v1', target: null }), false)
+  assert.equal(sameEquipment({ profile: 'repo-read-v1', target: t }, { profile: 'repo-read-v1', target: `${t}-x` }), false)
+})
+
+test('stripMintedEnv: a spawn body may not name its own credential or upstream (plan §2.6)', () => {
+  const { env, dropped } = stripMintedEnv({
+    CHANNEL_TOKEN: 'legit',
+    CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-ATTACKER',
+    anthropic_base_url: 'http://evil.example',
+    AGENT_BROKER_TOKEN: 'stolen',
+  })
+  assert.deepEqual(env, { CHANNEL_TOKEN: 'legit' })
+  assert.deepEqual(dropped.sort(), ['AGENT_BROKER_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'anthropic_base_url'])
+})
+
+test('spawn: the manager is the final authority — an unknown or still-gated profile is refused (400)', async () => {
+  const k8s = new MockK8s((name) => readyLoge(name, 'g', '127.0.0.1'))
+  const manager = new Manager({ k8s, config: baseConfig() })
+
+  const unknown = await manager.spawn({ kind: 'claude', id: 'r1', group: 'g', equipmentProfile: 'root-v1' })
+  assert.equal(unknown.status, 400)
+  assert.equal((unknown.body as any).error, 'unknown_profile')
+
+  // The exact case a stale agora projection would produce once P5 flips `visible` but the manager
+  // has not enabled it: offered in the UI, refused here. Fail-closed.
+  const gated = await manager.spawn({ kind: 'claude', id: 'r2', group: 'g', equipmentProfile: 'vault-v1' })
+  assert.equal(gated.status, 400)
+  assert.equal((gated.body as any).error, 'profile_disabled')
+
+  const targeted = await manager.spawn({ kind: 'claude', id: 'r3', group: 'g', target: 'github:arnaultbretagne/agora' })
+  assert.equal(targeted.status, 400)
+  assert.equal((targeted.body as any).error, 'target_forbidden', 'chat-v1 takes no target')
+
+  assert.equal(k8s.createCalls, 0, 'a refused profile must never provision anything')
+})
+
+test('spawn: credentialLease and minted env are refused, never forwarded to the loge (plan §2.6)', async () => {
+  let received: any
+  const ip = allocLoopback()
+  const loge = await startFakeServer((method, path, body) => {
+    if (method === 'POST' && path === '/sessions') {
+      received = JSON.parse(body)
+      return json(201, { id: 'r1', status: 'running' })
+    }
+    return json(404, { error: 'nf' })
+  }, LOGE_PORT, ip)
+  try {
+    const k8s = new MockK8s((name) => readyLoge(name, 'g-inject', ip))
+    const manager = new Manager({ k8s, config: baseConfig(), readyPollMs: 5 })
+    await manager.spawn({
+      kind: 'claude',
+      id: 'r1',
+      group: 'g-inject',
+      args: [],
+      env: { CHANNEL_TOKEN: 'legit', CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-ATTACKER-CHOSEN' },
+      credentialLease: { id: 'lease_forged', token: 'sk-ant-oat01-broker-forged', brokerUrl: 'http://evil' },
+    })
+    await manager.awaitSettled()
+    assert.deepEqual(received.env, { CHANNEL_TOKEN: 'legit' }, 'the minted env is stripped before forwarding')
+    assert.equal(received.credentialLease, undefined, 'a forged lease never reaches the supervisor')
+  } finally {
+    await loge.close()
+  }
+})
+
+test('equipment is part of a loge identity: re-equipping REPLACES the pod, drains it first, and revokes the old lease', async () => {
+  const minted: any[] = []
+  const revoked: string[] = []
+  const broker = await startFakeServer((method, path, body) => {
+    if (method === 'POST' && path === '/v1/leases') {
+      minted.push(JSON.parse(body))
+      return json(201, { leaseId: `lease_${minted.length}`, token: `sk-ant-oat01-broker-t${minted.length}` })
+    }
+    if (method === 'DELETE' && path.startsWith('/v1/leases/')) {
+      revoked.push(path.slice('/v1/leases/'.length))
+      return json(200, { revoked: true })
+    }
+    return json(404, { error: 'nf' })
+  }, 0, '127.0.0.1')
+  const ip = allocLoopback()
+  let drains = 0
+  const loge = await startFakeServer((method, path) => {
+    if (method === 'GET' && path === '/transcripts') {
+      drains++
+      return json(200, { uuids: [] })
+    }
+    if (method === 'POST' && path === '/sessions') return json(201, { id: 'r1', status: 'running' })
+    if (method === 'GET' && path === '/sessions') return json(200, { sessions: [] })
+    return json(404, { error: 'nf' })
+  }, LOGE_PORT, ip)
+  try {
+    const k8s = new MockK8s((name) => readyLoge(name, 'g-swap', ip))
+    const manager = new Manager({
+      k8s,
+      config: baseConfig({ useBroker: true, brokerAdminUrl: broker.url, brokerDataUrl: 'http://broker:8788' }),
+      readyPollMs: 5,
+    })
+    await manager.spawn({ kind: 'claude', id: 'r1', group: 'g-swap', args: [] })
+    await manager.awaitSettled()
+    assert.equal(k8s.createCalls, 1)
+    assert.deepEqual(minted[0], { runId: 'g-swap', profile: 'chat-v1' }, 'no profile named -> the chat floor')
+
+    // vault-v1 is deliberately still gated OFF, so spawn() would (correctly) 400 long before this
+    // path. Drive the loge layer directly: the swap mechanism has to be PROVEN right BEFORE P5 opens
+    // that gate — a loge silently keeping `vault:full` under a run journaled `chat-v1` is exactly the
+    // failure this palier exists to prevent.
+    const next = await (manager as any).getOrCreateLoge('g-swap', { profile: 'vault-v1', target: null })
+    assert.ok(!('error' in next), 'the re-equipped loge must come up')
+    assert.equal(k8s.createCalls, 2, 'the pod is REPLACED — a lease is frozen at mint, a pod env at creation')
+    assert.deepEqual(minted[1], { runId: 'g-swap', profile: 'vault-v1' })
+    assert.deepEqual(revoked, ['lease_1'], "the old equipment's lease dies with its loge")
+    assert.equal(drains, 1, 'drained BEFORE the swap: changing equipment must not silently reset the history')
+    assert.equal(k8s.pods.get('loge-g-swap').metadata.labels['agora.bretagne.dev/profile'], 'vault-v1')
+
+    // ...and the same equipment reuses, so an ordinary next turn stays warm.
+    const again = await (manager as any).getOrCreateLoge('g-swap', { profile: 'vault-v1', target: null })
+    assert.ok(!('error' in again))
+    assert.equal(k8s.createCalls, 2, 'same equipment -> plain reuse, no churn')
+    assert.equal(minted.length, 2)
+  } finally {
+    await loge.close()
+    await broker.close()
+  }
 })

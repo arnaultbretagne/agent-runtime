@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { K8sClient, type K8sPods, type HttpError } from './k8s.js'
 import { KNOWN_KINDS, isKnownKind } from './runtimes.js'
 import { getCapabilities } from './capabilities.js'
+import { DEFAULT_PROFILE, checkProfileTarget } from './broker/profiles.js'
 
 /**
  * The manager (agent-runtime ADR 0010 §1.1/§1.3): a superset of the supervisor's own control API.
@@ -75,15 +76,90 @@ const PLACEHOLDER_OAUTH_TOKEN =
 /** The singleton inference-proxy pod's name (agent-runs). The manager owns its lifecycle. */
 export const PROXY_POD_NAME = 'inference-proxy'
 
+/** What a run is equipped with (agora ADR 0012): a catalogue profile, plus a target for repo
+ *  profiles. Frozen into the run by agora; re-validated here, which is the final authority. */
+export interface Equipment {
+  profile: string
+  target: string | null
+}
+
+export const sameEquipment = (a: Equipment, b: Equipment): boolean =>
+  a.profile === b.profile && (a.target ?? null) === (b.target ?? null)
+
+export const describeEquipment = (e: Equipment): string => (e.target ? `${e.profile}@${e.target}` : e.profile)
+
+const LABEL_PROFILE = 'agora.bretagne.dev/profile'
+const ANNOTATION_TARGET = 'agora.bretagne.dev/target'
+const ANNOTATION_LEASE = 'agora.bretagne.dev/lease-id'
+
+/** Re-read a loge's equipment off the pod itself. The manager is jetable (ADR 0010 §1.3) — after a
+ *  restart the cluster is the only truth about what a running loge was equipped with, so the facts
+ *  ride on the pod. A pre-P4 loge carries no label and reads back as `chat-v1`: exactly what P3
+ *  minted it with, so adoption stays correct across the upgrade. */
+export function equipmentFromPod(pod: any): Equipment {
+  const profile = pod?.metadata?.labels?.[LABEL_PROFILE]
+  const target = pod?.metadata?.annotations?.[ANNOTATION_TARGET]
+  return {
+    profile: typeof profile === 'string' && profile ? profile : DEFAULT_PROFILE,
+    target: typeof target === 'string' && target ? target : null,
+  }
+}
+
+/** Env the manager MINTS onto the loge pod. A spawn body may not set these: the session env is
+ *  layered over the pod's in the child process, so accepting one would let a caller OVERRIDE the
+ *  credential and the base-URL the manager chose — i.e. name its own upstream (plan §2.6). */
+const MINTED_ENV: ReadonlySet<string> = new Set([
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'AGENT_BROKER_TOKEN',
+  'AGENT_BROKER_URL',
+  'ANTHROPIC_BASE_URL',
+  'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_API_KEY',
+])
+
+/** Drop any minted env off an inbound spawn body, reporting what was dropped so the caller can log
+ *  it. Names only — a refused value is never echoed anywhere. */
+export function stripMintedEnv(raw: unknown): { env?: Record<string, unknown>; dropped: string[] } {
+  if (!raw || typeof raw !== 'object') return { dropped: [] }
+  const dropped: string[] = []
+  const env: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (MINTED_ENV.has(k.toUpperCase())) dropped.push(k)
+    else env[k] = v
+  }
+  return { env, dropped }
+}
+
+/** Everything the manager MINTS and hands a loge at birth. Never sourced from a spawn body: the
+ *  manager is the only party that may decide what credential a loge holds (plan §2.6). */
+export interface LogeCustody {
+  /** The Claude credential the loge presents: a broker lease, or the inference-proxy placeholder. */
+  oauthToken: string
+  /** Where its inference must go: the broker data plane, or the inference-proxy. */
+  baseUrl: string
+  /** The equipment its lease was minted for — recorded on the pod so a restarted manager re-derives it. */
+  equipment: Equipment
+  /** The lease's ID (never its token — plan §2.6) — recorded so a restarted manager can still revoke it. */
+  leaseId?: string
+}
+
 /** The loge pod template (agent-runtime ADR 0010 §6 / infra-k8s ADR 0028 §3) — pinned here as the
  *  single source of truth; the plan's yaml is the spec this must match. */
-export function buildLogePodSpec(group: string, config: ManagerConfig, oauthToken: string, baseUrl: string): Record<string, unknown> {
+export function buildLogePodSpec(group: string, config: ManagerConfig, custody: LogeCustody): Record<string, unknown> {
+  const { oauthToken, baseUrl, equipment, leaseId } = custody
   return {
     apiVersion: 'v1',
     kind: 'Pod',
     metadata: {
       name: `loge-${group}`,
-      labels: { app: 'loge', 'agora.bretagne.dev/group': group },
+      // The profile is a LABEL (selectable: `kubectl get pods -l agora.bretagne.dev/profile=vault-v1`
+      // answers "what is privileged right now"). The target is an ANNOTATION — `github:owner/repo`
+      // is not a legal label value.
+      labels: { app: 'loge', 'agora.bretagne.dev/group': group, [LABEL_PROFILE]: equipment.profile },
+      annotations: {
+        ...(equipment.target ? { [ANNOTATION_TARGET]: equipment.target } : {}),
+        ...(leaseId ? { [ANNOTATION_LEASE]: leaseId } : {}),
+      },
     },
     spec: {
       restartPolicy: 'Never',
@@ -224,6 +300,9 @@ interface LogeEntry {
   /** The broker lease minted for this loge (P3, broker mode) — revoked when the loge is torn down.
    *  Only the leaseId is tracked (never the token); undefined on the inference-proxy path. */
   leaseId?: string
+  /** What that lease was minted for (agora ADR 0012). Part of the loge's identity: a run asking for
+   *  different equipment cannot reuse this loge — see getOrCreateLoge. */
+  equipment: Equipment
 }
 
 type RunLocation = { where: 'shared' } | { where: 'loge'; podName: string; group: string }
@@ -300,7 +379,14 @@ export class Manager {
       const group = pod.metadata?.labels?.['agora.bretagne.dev/group']
       const podName = pod.metadata?.name
       if (!group || !podName || !this.isReady(pod)) continue
-      this.loges.set(group, { podName })
+      // Both facts are re-read off the pod: its equipment (so a spawn asking for something else
+      // replaces it rather than silently inheriting) and its leaseId (so this manager can still
+      // revoke a lease minted by the instance it replaced, instead of leaking it to its TTL).
+      this.loges.set(group, {
+        podName,
+        equipment: equipmentFromPod(pod),
+        leaseId: pod.metadata?.annotations?.[ANNOTATION_LEASE],
+      })
       try {
         const sessions = await this.fetchLogeSessions(pod.status.podIP)
         for (const s of sessions) this.runLocations.set(s.id, { where: 'loge', podName, group })
@@ -319,8 +405,41 @@ export class Manager {
   async spawn(body: Record<string, unknown>): Promise<{ status: number; body: unknown }> {
     const substrate = this.deps.config.substrate
     // Strip any legacy `substrate` a transitional hub might still send — it is NOT a routing input
-    // (routing is the baked config above); `group` is the only body field the manager consumes.
-    const { substrate: _legacy, group: rawGroup, ...forwarded } = body
+    // (routing is the baked config above). `group` and the equipment pair are manager-consumed:
+    // the supervisor has no use for them. `credentialLease` is REFUSED, not consumed: only the
+    // manager may decide what credential a loge holds (plan §2.6).
+    const {
+      substrate: _legacy,
+      group: rawGroup,
+      equipmentProfile: rawProfile,
+      target: rawTarget,
+      credentialLease: injectedLease,
+      ...rest
+    } = body
+    const { env, dropped } = stripMintedEnv(rest.env)
+    const forwarded: Record<string, unknown> = { ...rest, ...(env ? { env } : {}) }
+    if (injectedLease !== undefined || dropped.length > 0) {
+      // Loud on purpose: nothing legitimate sends these, so this is either a bug in a caller or the
+      // hub speaking for a browser that tried to pick its own credential.
+      console.error(
+        `[manager] refused minted fields on a spawn body: ${[
+          ...(injectedLease !== undefined ? ['credentialLease'] : []),
+          ...dropped,
+        ].join(', ')}`,
+      )
+    }
+
+    // The manager is the FINAL authority on equipment (plan §P4.4): agora validates too, but a
+    // profile this version does not know — or one it knows and has not enabled — is refused here,
+    // whatever agora's (possibly stale) projection offered.
+    const check = checkProfileTarget(
+      typeof rawProfile === 'string' && rawProfile ? rawProfile : DEFAULT_PROFILE,
+      typeof rawTarget === 'string' ? rawTarget : null,
+    )
+    if (!check.ok) {
+      return { status: 400, body: { error: check.error, ...(check.detail ? { detail: check.detail } : {}) } }
+    }
+    const equipment: Equipment = { profile: check.profile.name, target: check.target }
 
     if (substrate === 'shared') {
       const result = await this.forwardSpawn(this.deps.config.sharedSupervisorUrl, forwarded)
@@ -341,16 +460,24 @@ export class Manager {
     // build the loge in the background. The hub READS the status (creating → running | exited) via
     // GET /sessions/:id instead of guessing boot from an ambiguous absence + a settle window.
     this.creating.set(id, { group, since: Date.now() })
-    this.settling.set(id, this.createLogeAndForward(id, group, forwarded).finally(() => this.settling.delete(id)))
+    this.settling.set(
+      id,
+      this.createLogeAndForward(id, group, equipment, forwarded).finally(() => this.settling.delete(id)),
+    )
     return { status: 202, body: { id, status: 'creating' } }
   }
 
   /** The background half of an isolated spawn: create/reuse the loge, inject resume custody (§4),
    *  forward — resolving the run's readable status (creating → running | exited). Bounded by
    *  getOrCreateLoge's own timeout, so a `creating` run always resolves to a definite fact. */
-  private async createLogeAndForward(id: string, group: string, forwarded: Record<string, unknown>): Promise<void> {
+  private async createLogeAndForward(
+    id: string,
+    group: string,
+    equipment: Equipment,
+    forwarded: Record<string, unknown>,
+  ): Promise<void> {
     try {
-      const loge = await this.getOrCreateLoge(group)
+      const loge = await this.getOrCreateLoge(group, equipment)
       if ('error' in loge) return this.markExited(id, loge.error)
 
       const resumeUuid = this.extractResumeUuid(forwarded.args)
@@ -407,16 +534,44 @@ export class Manager {
     return idx >= 0 && typeof args[idx + 1] === 'string' ? (args[idx + 1] as string) : undefined
   }
 
+  /**
+   * The loge for a group, equipped as the run asked — reused when it already matches, REPLACED when
+   * it does not (agora ADR 0012 §3). Equipment is part of a loge's identity because neither half of
+   * it can change in place: a lease's claims are frozen at mint, and a pod's env at creation. Reusing
+   * a mismatched loge would hand the new run the OLD profile — a run journaled `chat-v1` still
+   * holding `vault:full` (plan invariant #5). The cost is a cold loge on every equipment switch,
+   * which is the same cost the product already pays for any other config change (agora ADR 0010).
+   */
   private async getOrCreateLoge(
     group: string,
+    equipment: Equipment,
   ): Promise<{ podName: string; podIp: string } | { error: 'quota_exceeded' }> {
     const existing = this.loges.get(group)
     if (existing) {
       const pod = await this.deps.k8s.getPod(existing.podName)
       const ip = pod?.status?.podIP
-      if (pod && ip && this.isReady(pod)) return { podName: existing.podName, podIp: ip }
-      await this.revokeLease(existing.leaseId) // stale entry — its lease dies with it
-      this.loges.delete(group) // (pod gone/unready) — fall through and recreate
+      const live = Boolean(pod && ip && this.isReady(pod))
+      if (live && sameEquipment(existing.equipment, equipment)) return { podName: existing.podName, podIp: ip as string }
+      if (live) {
+        console.log(
+          `[manager] ${group}: re-equipping ${describeEquipment(existing.equipment)} → ${describeEquipment(equipment)} — replacing the loge`,
+        )
+        // The loge holds the only live copy of its native transcripts; the idle-reap path drains for
+        // exactly this reason. Without it, switching equipment would cost the conversation its resume
+        // anchor (ADR 0007) — a silent history reset dressed up as a settings change.
+        await this.drainLoge(existing.podName, ip as string)
+      }
+      // Not reusable, either way. Delete and WAIT for it to be gone: `loge-<group>` is a deterministic
+      // name, so racing a Terminating pod makes createPod 409 and the adopt branch below hand this run
+      // the OLD pod — carrying the lease we are about to revoke.
+      await this.deps.k8s.deletePod(existing.podName).catch(() => {})
+      await this.revokeLease(existing.leaseId)
+      this.forgetRunsFor(existing.podName)
+      this.loges.delete(group)
+      if (!(await this.waitGone(existing.podName))) {
+        console.error(`[manager] ${existing.podName} still Terminating past logeReadyTimeoutMs — refusing to adopt it`)
+        return { error: 'quota_exceeded' }
+      }
     }
 
     // The loge is dispossessed — it reaches Anthropic only through a trusted egress that holds the real
@@ -427,7 +582,7 @@ export class Manager {
     let baseUrl: string
     let leaseId: string | undefined
     if (this.deps.config.useBroker) {
-      const lease = await this.mintLease(group)
+      const lease = await this.mintLease(group, equipment)
       if (!lease) return { error: 'quota_exceeded' } // broker unreachable → provision failure (rollback: USE_BROKER=false)
       oauthToken = lease.token
       baseUrl = this.deps.config.brokerDataUrl
@@ -442,7 +597,7 @@ export class Manager {
     await this.createGate.acquire()
     try {
       const podName = `loge-${group}`
-      const spec = buildLogePodSpec(group, this.deps.config, oauthToken, baseUrl)
+      const spec = buildLogePodSpec(group, this.deps.config, { oauthToken, baseUrl, equipment, leaseId })
       let pod: any
       try {
         pod = await this.deps.k8s.createPod(spec)
@@ -466,10 +621,22 @@ export class Manager {
         await this.revokeLease(leaseId)
         return { error: 'quota_exceeded' }
       }
-      this.loges.set(group, { podName, leaseId })
+      this.loges.set(group, { podName, leaseId, equipment })
       return { podName, podIp: ready.status.podIP }
     } finally {
       this.createGate.release()
+    }
+  }
+
+  /** Poll until a pod is really gone. Deliberately bounded by the same timeout as readiness: a pod
+   *  stuck Terminating (gVisor teardown is not instant) must surface as a provision failure, never as
+   *  a silent adoption of the pod we just condemned. */
+  private async waitGone(podName: string): Promise<boolean> {
+    const deadline = Date.now() + this.deps.config.logeReadyTimeoutMs
+    for (;;) {
+      if (!(await this.deps.k8s.getPod(podName))) return true
+      if (Date.now() >= deadline) return false
+      await sleep(this.readyPollMs)
     }
   }
 
@@ -504,15 +671,20 @@ export class Manager {
     await this.ensureProxyBaseUrl()
   }
 
-  /** Mint a per-loge broker lease (P3, broker mode). `chat-v1` is the only enabled profile until P4
-   *  wires the run's real equipment (agora ADR 0012). Returns undefined if the broker admin plane is
+  /** Mint a per-loge broker lease (P3, broker mode) for the run's validated equipment (P4). The
+   *  profile/target here have already passed `checkProfileTarget` in spawn(); the broker checks them
+   *  again on its own side of the boundary. Returns undefined if the broker admin plane is
    *  unreachable — the caller treats that as a provision failure (rollback: USE_BROKER=false). */
-  private async mintLease(group: string): Promise<{ leaseId: string; token: string } | undefined> {
+  private async mintLease(group: string, equipment: Equipment): Promise<{ leaseId: string; token: string } | undefined> {
     try {
       const res = await fetch(`${this.deps.config.brokerAdminUrl}/v1/leases`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ runId: group, profile: 'chat-v1' }),
+        body: JSON.stringify({
+          runId: group,
+          profile: equipment.profile,
+          ...(equipment.target ? { target: equipment.target } : {}),
+        }),
         signal: AbortSignal.timeout(3000),
       })
       if (!res.ok) {
