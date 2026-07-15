@@ -6,7 +6,13 @@
  * and form shape only, never capabilities. Regenerate it whenever the catalogue changes (notably when
  * P5/P6 flip a profile's `visible`):
  *
- *   npm run print-projection > ../agora/shared/equipment-catalogue.json
+ *   npm run --silent print-projection > ../agora/shared/equipment-catalogue.json
+ *
+ * `--silent` is NOT optional and this is not a style preference: npm prints its `> pkg@ver script`
+ * banner on STDOUT, so without it the banner lands at the top of the file and the JSON is corrupt.
+ * The recipe here said otherwise until 2026-07-15, when following it produced exactly that (agora's
+ * tests caught it: `SyntaxError: Unexpected token '>'`). `npx tsx src/broker/print-projection.ts`
+ * works too.
  *
  * A stale copy is fail-closed by construction: agora can only ever offer a name the manager then
  * re-checks against the real catalogue and refuses.

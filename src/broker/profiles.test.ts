@@ -8,19 +8,29 @@ import {
   publicProjection,
 } from './profiles.js'
 
-test('catalogue: chat + vault are open (P5); every repo profile is still gated off', () => {
+test('catalogue: chat + vault (P5) and repo READ (P6.5) are open; every WRITE profile is still gated off', () => {
   // This test IS the gate's tripwire: opening a profile has to be a deliberate edit here, never a
   // side effect of some other change. Each name below is a real capability over Arnault's data.
-  for (const n of ['chat-v1', 'vault-v1']) {
-    assert.equal(CATALOGUE[n].enabled, true, `${n} is open as of P5`)
+  for (const n of ['chat-v1', 'vault-v1', 'repo-read-v1']) {
+    assert.equal(CATALOGUE[n].enabled, true, `${n} is open`)
     assert.equal(CATALOGUE[n].visible, true)
   }
-  for (const n of ['repo-read-v1', 'repo-dev-v1', 'repo-dev-vault-v1']) {
+  // The line that still matters. Read is nearly free (these repos are public — a loge can clone them
+  // token-free anyway); WRITE is where an agent starts changing Arnault's repos, and it stays shut
+  // until the loge can open a PR without putting the token in its own argv.
+  for (const n of ['repo-dev-v1', 'repo-dev-vault-v1']) {
     assert.equal(CATALOGUE[n].enabled, false, `${n} must stay disabled until its palier`)
     assert.equal(CATALOGUE[n].visible, false, `${n} must not even be offered in the UI`)
   }
   assert.deepEqual([...CATALOGUE['chat-v1'].capabilities], ['claude:invoke'], 'chat must never gain a capability by accident')
   assert.deepEqual([...CATALOGUE['vault-v1'].capabilities], ['claude:invoke', 'vault:full'])
+  // An open profile must not carry a write capability: this is the assertion that fails if someone
+  // ever pastes `github:contents:write` into the read profile.
+  assert.equal(
+    CATALOGUE['repo-read-v1'].capabilities.some((c) => c.endsWith(':write')),
+    false,
+    'repo-read-v1 is open — it must never earn a write capability',
+  )
 })
 
 test('getProfile: known vs unknown, no prototype pollution', () => {
@@ -37,12 +47,16 @@ test('normalizeTarget: lowercases and validates syntax; GitHub does the bounding
   // that is not Arnault's cannot exist. Duplicating that as a code list only re-created friction.
 })
 
-test('checkProfileTarget: reachable P2 paths', () => {
+test('checkProfileTarget: reachable paths', () => {
   assert.equal((checkProfileTarget('nope', null) as { error: string }).error, 'unknown_profile')
-  // repo-read-v1 is disabled in P2, so it is rejected before the target is even considered
-  assert.equal((checkProfileTarget('repo-read-v1', 'github:arnaultbretagne/agora') as { error: string }).error, 'profile_disabled')
+  // repo-dev-v1 is the still-gated profile now that P6.5 opened repo-read-v1 — rejected before the
+  // target is even considered.
+  assert.equal((checkProfileTarget('repo-dev-v1', 'github:arnaultbretagne/agora') as { error: string }).error, 'profile_disabled')
   assert.equal(checkProfileTarget('chat-v1', null).ok, true)
+  assert.equal(checkProfileTarget('repo-read-v1', null).ok, true, 'the open read profile takes no target')
   assert.equal((checkProfileTarget('chat-v1', 'github:x/y') as { error: string }).error, 'target_forbidden')
+  // No profile takes a target any more, so passing one is refused even for a repo profile.
+  assert.equal((checkProfileTarget('repo-read-v1', 'github:x/y') as { error: string }).error, 'target_forbidden')
 })
 
 test('publicProjection carries label + shape, never capabilities or the enabled gate', () => {

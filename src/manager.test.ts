@@ -524,8 +524,8 @@ test('spawn: the manager is the final authority — an unknown or still-gated pr
   assert.equal((unknown.body as any).error, 'unknown_profile')
 
   // The exact case a stale agora projection would produce: offered in the UI, refused here.
-  // Fail-closed. repo-read-v1 is the still-gated profile now that P5 opened vault-v1.
-  const gated = await manager.spawn({ kind: 'claude', id: 'r2', group: 'g', equipmentProfile: 'repo-read-v1', target: 'github:arnaultbretagne/agora' })
+  // Fail-closed. repo-dev-v1 is the still-gated profile now that P6.5 opened repo-read-v1.
+  const gated = await manager.spawn({ kind: 'claude', id: 'r2', group: 'g', equipmentProfile: 'repo-dev-v1' })
   assert.equal(gated.status, 400)
   assert.equal((gated.body as any).error, 'profile_disabled')
 
