@@ -9,7 +9,7 @@ import { createServer, request as httpRequest, type IncomingMessage, type Server
 import type { LeaseStore, LeaseClaims } from './lease-store.js'
 import type { Auditor } from './audit.js'
 import type { FrontConfig } from './config.js'
-import { authorize, checkTarget } from './auth.js'
+import { authorize } from './auth.js'
 
 function sendJson(res: ServerResponse, code: number, body: unknown): void {
   res.writeHead(code, { 'content-type': 'application/json' })
@@ -20,14 +20,18 @@ interface Route {
   adapter: 'claude' | 'vault' | 'github'
   url: string
   capability: string
-  needsTarget: boolean
 }
 
 function routeFor(path: string, cfg: FrontConfig): Route {
-  if (path.startsWith('/v1/vault/')) return { adapter: 'vault', url: cfg.adapters.vault, capability: 'vault:full', needsTarget: false }
-  if (path.startsWith('/v1/github/')) return { adapter: 'github', url: cfg.adapters.github, capability: 'github:metadata:read', needsTarget: true }
+  if (path.startsWith('/v1/vault/')) return { adapter: 'vault', url: cfg.adapters.vault, capability: 'vault:full' }
+  // This route carried `needsTarget: true` until 2026-07-15 and silently 403'd EVERY GitHub token
+  // request from the moment P6 dropped `target` from the profiles: no lease can carry a target any
+  // more, and the check refused a lease without one. It shipped because nothing tested this route —
+  // servers.test.ts configured a github adapter and never called it. The per-run target mechanism is
+  // gone from the authorization path with it; `claims.target` survives only as a run FACT.
+  if (path.startsWith('/v1/github/')) return { adapter: 'github', url: cfg.adapters.github, capability: 'github:metadata:read' }
   // default: the Anthropic-compatible surface Claude Code uses (/v1/messages, …).
-  return { adapter: 'claude', url: cfg.adapters.claude, capability: 'claude:invoke', needsTarget: false }
+  return { adapter: 'claude', url: cfg.adapters.claude, capability: 'claude:invoke' }
 }
 
 /** Forward the request to the adapter: strip the lease, attach the claims as internal headers,
@@ -74,13 +78,6 @@ export function createDataServer(store: LeaseStore, cfg: FrontConfig, audit: Aud
     if (!auth.ok) {
       audit('lease.denied', { adapter: route.adapter, result: auth.error })
       return sendJson(res, auth.status, { error: auth.error })
-    }
-    if (route.needsTarget) {
-      const t = checkTarget(auth.claims, undefined) // the lease's frozen target is authoritative in v1
-      if (!t.ok) {
-        audit('lease.denied', { adapter: route.adapter, leaseId: auth.claims.leaseId, result: t.error })
-        return sendJson(res, t.status, { error: t.error })
-      }
     }
     audit('lease.used', { leaseId: auth.claims.leaseId, runId: auth.claims.runId, profile: auth.claims.profile, target: auth.claims.target, adapter: route.adapter })
     forward(route, auth.claims, req, res, audit)

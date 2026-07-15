@@ -135,3 +135,56 @@ test('admin revoke -> the lease is dead on the data plane (401)', async () => {
   assert.equal(r.status, 401)
   assert.equal(r.body.error, 'lease_invalid')
 })
+
+// ---------------------------------------------------------------------------------------------
+// The GitHub route. Added 2026-07-15 after this route shipped BROKEN: it carried `needsTarget:
+// true`, so from the moment P6 dropped `target` from the profiles it 403'd every token request —
+// and nothing here noticed, because the suite configured a github adapter and never called it.
+//
+// The lease below is minted through the REAL admin API against the REAL catalogue. That is the
+// whole point: the old auth.test.ts checked this rule against a hand-built claims object carrying
+// a target, i.e. a lease shape the system can no longer produce. It passed while production was
+// dead. A test may not invent a state its own system cannot reach.
+// ---------------------------------------------------------------------------------------------
+
+const readMint = await call(ADMIN, '/v1/leases', {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ runId: 'run_R', profile: 'repo-read-v1' }),
+})
+const READ_LEASE = readMint.body.token as string
+
+test('a repo-read-v1 lease REACHES the github adapter — the route the loge’s credential helper uses', async () => {
+  assert.equal(readMint.status, 201, `the catalogue must actually mint this profile: ${JSON.stringify(readMint.body)}`)
+  const before = forwarded.length
+  const r = await call(DATA, '/v1/github/token', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${READ_LEASE}` },
+  })
+  assert.equal(r.status, 200, 'a valid repo lease must not be refused by the front')
+  assert.equal(forwarded.length, before + 1, 'the request must actually be FORWARDED, not answered by the front')
+  assert.equal(forwarded[forwarded.length - 1].path, '/v1/github/token')
+  assert.match(auditLines.join('\n'), /"event":"lease.used".*"adapter":"github"/, 'a used lease must be audited as used')
+})
+
+test('a chat-v1 lease is refused the github route (403) and never reaches the adapter', async () => {
+  // A FRESH chat lease: the one minted at the top of this file is deliberately revoked by an
+  // earlier test, and reusing it here would assert 401 (dead lease) while claiming to prove 403
+  // (live lease, wrong profile) — a different guarantee entirely.
+  const chat = await call(ADMIN, '/v1/leases', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ runId: 'run_C2', profile: 'chat-v1' }),
+  })
+  const before = forwarded.length
+  const r = await call(DATA, '/v1/github/token', { method: 'POST', headers: { authorization: `Bearer ${chat.body.token as string}` } })
+  assert.equal(r.status, 403, 'a LIVE chat lease must be refused for lacking the capability, not for being dead')
+  assert.equal(r.body.error, 'capability_denied')
+  assert.equal(forwarded.length, before, 'a denied lease must not reach the adapter at all')
+})
+
+test('no lease at all is refused the github route (401)', async () => {
+  const r = await call(DATA, '/v1/github/token', { method: 'POST' })
+  assert.equal(r.status, 401)
+  assert.equal(r.body.error, 'lease_missing')
+})
