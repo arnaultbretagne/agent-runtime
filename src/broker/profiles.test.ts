@@ -6,7 +6,6 @@ import {
   normalizeTarget,
   checkProfileTarget,
   publicProjection,
-  deniedForWrite,
 } from './profiles.js'
 
 test('catalogue: chat + vault are open (P5); every repo profile is still gated off', () => {
@@ -31,14 +30,11 @@ test('getProfile: known vs unknown, no prototype pollution', () => {
   assert.equal(getProfile('__proto__'), undefined)
 })
 
-test('normalizeTarget: lowercases, validates syntax, hard-denies infra-k8s', () => {
+test('normalizeTarget: lowercases and validates syntax; GitHub does the bounding', () => {
   assert.deepEqual(normalizeTarget('github:ArnaultBretagne/Agora'), { ok: true, target: 'github:arnaultbretagne/agora' })
   assert.equal((normalizeTarget('not-a-target') as { error: string }).error, 'target_malformed')
-  assert.equal((normalizeTarget('github:arnaultbretagne/infra-k8s') as { error: string }).error, 'target_denied')
-  // A stranger's repo is no longer refused HERE: the allow-list is gone, and GitHub is what bounds
-  // us — the App is installed on one account, so a token for someone else's repo cannot exist.
-  // Duplicating that as a code list only re-created the friction it was meant to remove.
-  assert.equal(normalizeTarget('github:someone/random').ok, true)
+  // Nothing is refused by name any more: the App is installed on one account, so a token for a repo
+  // that is not Arnault's cannot exist. Duplicating that as a code list only re-created friction.
 })
 
 test('checkProfileTarget: reachable P2 paths', () => {
@@ -66,17 +62,13 @@ test('publicProjection carries label + shape, never capabilities or the enabled 
   }
 })
 
-test('the deny-list is the only barrier on infra-k8s, so presentation must not dodge it', () => {
-  // No allow-list any more: the App is installed on one account, so GitHub already bounds an agent
-  // to Arnault's repos. This list is what stops the ONE repo whose write undoes every other control.
-  for (const dodge of [
-    'arnaultbretagne/infra-k8s',
-    'ArnaultBretagne/Infra-K8s',
-    '  arnaultbretagne/infra-k8s  ',
-    'arnaultbretagne/infra-k8s.git',
-  ]) {
-    assert.equal(deniedForWrite(dodge), true, `${JSON.stringify(dodge)} must be denied`)
-  }
-  assert.equal(deniedForWrite('arnaultbretagne/agora'), false)
-  assert.equal(normalizeTarget('github:ArnaultBretagne/INFRA-K8S').ok, false, 'and via the target path too')
+test('no repo is barred at the token layer — including infra-k8s', () => {
+  // Plan invariant #10 (a hard infra-k8s deny-list) is deliberately dropped. With the repository
+  // ruleset active, excluding it only stopped an agent OPENING a PR — noise, not compromise — while
+  // barring agents from the infra work that is most of the real job. What actually stops an agent
+  // rewriting its own confinement: it cannot merge (a review it cannot give itself), and it cannot
+  // disable the ruleset (the App has no `Administration` permission).
+  assert.equal(normalizeTarget('github:arnaultbretagne/infra-k8s').ok, true)
+  assert.equal(normalizeTarget('github:someone/random').ok, true)
+  assert.equal((normalizeTarget('not-a-target') as { error: string }).error, 'target_malformed')
 })

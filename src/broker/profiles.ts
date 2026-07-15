@@ -11,7 +11,18 @@
  * scoping READ protects nothing on repos that are public anyway. The target plumbing survives in
  * the types and the run facts (additive, harmless); nothing sets one.
  *
- * `infra-k8s` remains hard-denied for WRITE (plan invariant #10) — see REPO_DENYLIST.
+ * There is no repo deny-list either, including for `infra-k8s`. That was plan invariant #10, and it
+ * is deliberately dropped: with the repository RULESET active (PR + an approving review the App
+ * cannot give itself, no force-push, no deletion, App not a bypass actor), the deny-list only
+ * stopped an agent from OPENING a pull request — noise, not compromise. Meanwhile it barred agents
+ * from the infra work that is most of this platform's actual workload.
+ *
+ * What keeps an agent from editing what confines it is therefore, in order:
+ *   1. it cannot merge — the ruleset requires a review, and nobody approves their own PR;
+ *   2. it cannot disable the ruleset — the App has no `Administration` permission;
+ *   3. a human reads the diff before approving. On infra-k8s that human must not be a rubber stamp:
+ *      that repo's manifests ARE the confinement (NetworkPolicies, USE_BROKER, the catalogue).
+ * Point 3 is process, not code, and this file cannot enforce it.
  */
 
 export interface Profile {
@@ -115,29 +126,6 @@ export function getProfile(name: string): Profile | undefined {
   return Object.prototype.hasOwnProperty.call(CATALOGUE, name) ? CATALOGUE[name] : undefined
 }
 
-/**
- * Repos an agent may never WRITE to, whatever the App's installation says (plan invariant #10).
- *
- * There is deliberately no allow-list any more. The App is installed on one account with
- * `repository_selection: all`, so GitHub already bounds an agent to Arnault's own repos; a
- * hand-kept list on top of that only re-created the friction it was meant to remove, and would
- * have to be edited for every new repo.
- *
- * `infra-k8s` is the one hard line, and only for WRITE. Reading it is pointless to deny — it is
- * public. Writing it is not "one more sensitive repo": it holds the NetworkPolicies, the manager's
- * env and the deployed catalogue, i.e. the manifests that ENFORCE an agent's own confinement. A
- * single merged commit there (USE_BROKER=false, an opened egress, an extra profile) undoes every
- * other control in this system. The repository ruleset already stops the App merging — this stops
- * it even opening a plausible PR that a distracted human might merge.
- */
-export const REPO_DENYLIST: ReadonlySet<string> = new Set(['arnaultbretagne/infra-k8s'])
-
-/** Is this `owner/repo` slug barred from write? Case/whitespace-insensitive: the deny-list is now
- *  the ONLY barrier on that repo, so it must not be dodgeable by presentation. */
-export function deniedForWrite(slug: string): boolean {
-  return REPO_DENYLIST.has(slug.trim().toLowerCase().replace(/\.git$/, ''))
-}
-
 const GITHUB_TARGET_RE = /^github:([a-z0-9][a-z0-9-]*)\/([a-z0-9._-]+)$/
 
 export type TargetResult =
@@ -151,7 +139,6 @@ export function normalizeTarget(raw: string): TargetResult {
   const m = GITHUB_TARGET_RE.exec(lowered)
   if (!m) return { ok: false, error: 'target_malformed', detail: 'expected github:<owner>/<repo>' }
   const slug = `${m[1]}/${m[2]}`
-  if (deniedForWrite(slug)) return { ok: false, error: 'target_denied', detail: 'repository is deny-listed' }
   return { ok: true, target: `github:${slug}` }
 }
 

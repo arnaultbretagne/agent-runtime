@@ -8,9 +8,9 @@
  * What each profile earns (capability -> permission set lives here, beside the catalogue, so agora
  * names a profile and never learns what it unlocks):
  *
- *   github:contents:read      -> {contents: read, metadata: read}   on ALL installed repos
+ *   github:contents:read      -> {contents: read, metadata: read}    on ALL installed repos
  *   github:contents:write     -> {contents: write, pull_requests: write, metadata: read}
- *                                on all installed repos EXCEPT the deny-list
+ *                                on ALL installed repos, infra-k8s included
  *
  * No per-run repo target. Scoping READ buys nothing (the repos are public, and a loge has no
  * internet — the broker is already the only door), and scoping WRITE buys nothing either: GitHub has
@@ -19,12 +19,15 @@
  * disposing is drawn by the repository RULESET. A repo scope would only have broken the real
  * workflow, where one change spans several repos at once.
  *
- * So the deny-list is the single hard line, and it is enforced by CONSTRUCTION: a write token is
- * minted with an explicit repository list that excludes it, so GitHub itself refuses — the agent
- * does not hold a credential that can reach infra-k8s at all.
+ * And no deny-list, infra-k8s included: with the ruleset active, excluding it would only stop an
+ * agent OPENING a PR — noise, not compromise — while barring it from the infra work that is most of
+ * the real job. What stops an agent editing its own confinement is that it cannot MERGE (the ruleset
+ * requires a review it cannot give itself) and cannot turn the ruleset off (the App has no
+ * `Administration` permission). The last line of defence is a human actually reading an infra-k8s
+ * diff before approving it — process, which no code here can enforce.
  */
 import { startAdapter, type AdapterHandler, type AdapterClaims } from './adapter-common.js'
-import { getProfile, deniedForWrite } from './profiles.js'
+import { getProfile } from './profiles.js'
 import { GitHubAppTokens, readAppKey, type MintedToken } from './github-token.js'
 
 const TOKEN_PATH = '/v1/github/token'
@@ -66,18 +69,11 @@ export function createGitHubForwarder(opts: GitHubForwarderOpts): AdapterHandler
       if (!want) return sendJson(res, 403, { error: 'capability_denied' })
 
       try {
-        let repositories: string[] | undefined
-        if (want.write) {
-          // Enforced by construction: the deny-listed repo is left OUT of the token's repo list, so
-          // GitHub refuses it — rather than us trusting a check somewhere downstream to hold.
-          const all = await opts.tokens.listRepositories()
-          repositories = all.filter((r) => !deniedForWrite(r.full_name)).map((r) => r.name)
-          const denied = all.length - repositories.length
-          if (denied > 0) console.log(`[broker-github] write scope excludes ${denied} deny-listed repo(s)`)
-          if (repositories.length === 0) return sendJson(res, 403, { error: 'no_writable_repositories' })
-        }
-
-        const minted: MintedToken = await opts.tokens.get({ permissions: want.permissions, repositories })
+        // No repo scope, and no deny-list — not even infra-k8s. The ruleset is what bounds a write
+        // token (PR + a review the App cannot give itself), and the App has no `Administration`
+        // permission, so an agent cannot switch that guard off. Excluding repos here would only stop
+        // an agent OPENING a PR, while barring it from the infra work that is most of the real job.
+        const minted: MintedToken = await opts.tokens.get({ permissions: want.permissions })
         // Only the token and its bounds. The loge gets what git needs and not one field more —
         // no installation id, no App id, no JWT.
         sendJson(res, 200, {

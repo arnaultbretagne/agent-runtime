@@ -87,16 +87,23 @@ test('read profile: a token on ALL repos, read-only, with an expiry — and no t
   assert.ok(Date.parse(r.body.expiresAt) > Date.now())
 })
 
-test('write profile: infra-k8s is excluded from the token BY CONSTRUCTION, not by a downstream check', async () => {
+test('write profile: an unscoped token on ALL repos — infra-k8s included, by decision', () => {
+  // The ruleset is what bounds this token, not its repo scope: the App cannot merge (a review it
+  // cannot give itself) and cannot disable the ruleset (no `Administration` permission). Excluding
+  // infra-k8s here would only have stopped an agent OPENING a PR, while barring it from the infra
+  // work that is most of the real job.
+  const of = permissionsFor({ leaseId: 'l', runId: 'r', profile: 'repo-dev-v1', target: null })!
+  assert.equal(of.write, true)
+  assert.deepEqual(of.permissions, { contents: 'write', pull_requests: 'write', metadata: 'read' })
+})
+
+test('write profile mints unscoped, so one run can span several repos — the real workflow', async () => {
   lastMint = undefined
   const r = await ask('repo-dev-v1')
   assert.equal(r.status, 200)
-  // The repo list sent to GitHub is what enforces it: the agent never holds a credential that can
-  // reach infra-k8s, so there is no check left to bypass.
-  assert.deepEqual(lastMint.repositories.sort(), ['agent-runtime', 'agora', 'portfolio'])
-  assert.equal(lastMint.repositories.includes('infra-k8s'), false, 'the one repo whose write undoes every other control')
+  assert.equal('repositories' in lastMint, false, 'no repo scope: [] would grant nothing, and a list breaks multi-repo work')
   assert.deepEqual(lastMint.permissions, { contents: 'write', pull_requests: 'write', metadata: 'read' })
-  assert.equal((r.body.repositories as string[]).some((x) => x.endsWith('/infra-k8s')), false)
+  assert.equal(r.body.repositories, 'all')
 })
 
 test('the response carries the token and its bounds — never the App id, installation id or JWT', async () => {
