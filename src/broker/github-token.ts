@@ -212,24 +212,6 @@ export class GitHubAppTokens {
     return minted
   }
 
-  /** Every repo in the installation — the raw material for a write scope that must exclude some. */
-  async listRepositories(): Promise<Array<{ name: string; full_name: string }>> {
-    const jwt = this.appJwt()
-    const installation = await this.resolveInstallation(jwt)
-    const r = await this.api(`/app/installations/${installation}/access_tokens`, jwt, {
-      method: 'POST',
-      body: JSON.stringify({ permissions: { metadata: 'read' } }),
-    })
-    if (!r.ok) throw new GitHubAppTokensError(`metadata token request returned ${r.status}`, r.status)
-    const tok = ((await r.json()) as { token?: string }).token
-    if (!tok) throw new GitHubAppTokensError('GitHub returned no token')
-    const lr = await this.doFetch(`${this.apiBase}/installation/repositories?per_page=100`, {
-      headers: { authorization: `Bearer ${tok}`, accept: 'application/vnd.github+json', 'user-agent': 'agent-broker' },
-      signal: AbortSignal.timeout(8000),
-    })
-    if (!lr.ok) throw new GitHubAppTokensError(`listing repositories returned ${lr.status}`, lr.status)
-    return ((await lr.json()) as { repositories: Array<{ name: string; full_name: string }> }).repositories
-  }
 }
 
 /** Alias kept short at the throw sites above. */
