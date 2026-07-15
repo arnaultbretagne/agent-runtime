@@ -50,14 +50,19 @@ export const CATALOGUE: Readonly<Record<string, Profile>> = Object.freeze({
     true,
     true,
   ),
+  // ENABLED 2026-07-15 (P5). The credential chain behind it is proven live: the broker mints its own
+  // Pocket-ID machine bearer, the vault MCP now gates on that client's `sub`, and a forged-audience
+  // token from any other client is refused (403). `vault:full` stays deliberately coarse — the MCP
+  // server cannot authorize per tool, so advertising a `vault:read` would be a scoping we cannot
+  // actually enforce.
   'vault-v1': profile(
     'vault-v1',
     'Vault',
     'Lecture et écriture sur tout le vault Obsidian.',
     ['claude:invoke', 'vault:full'],
     false,
-    false,
-    false,
+    true,
+    true,
   ),
   'repo-read-v1': profile(
     'repo-read-v1',

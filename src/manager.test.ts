@@ -12,6 +12,8 @@ import {
   equipmentFromPod,
   sameEquipment,
   stripMintedEnv,
+  mcpServersFor,
+  withMcpServers,
   type ManagerConfig,
 } from './manager.js'
 import type { K8sPods, HttpError } from './k8s.js'
@@ -521,9 +523,9 @@ test('spawn: the manager is the final authority — an unknown or still-gated pr
   assert.equal(unknown.status, 400)
   assert.equal((unknown.body as any).error, 'unknown_profile')
 
-  // The exact case a stale agora projection would produce once P5 flips `visible` but the manager
-  // has not enabled it: offered in the UI, refused here. Fail-closed.
-  const gated = await manager.spawn({ kind: 'claude', id: 'r2', group: 'g', equipmentProfile: 'vault-v1' })
+  // The exact case a stale agora projection would produce: offered in the UI, refused here.
+  // Fail-closed. repo-read-v1 is the still-gated profile now that P5 opened vault-v1.
+  const gated = await manager.spawn({ kind: 'claude', id: 'r2', group: 'g', equipmentProfile: 'repo-read-v1', target: 'github:arnaultbretagne/agora' })
   assert.equal(gated.status, 400)
   assert.equal((gated.body as any).error, 'profile_disabled')
 
@@ -621,4 +623,70 @@ test('equipment is part of a loge identity: re-equipping REPLACES the pod, drain
     await loge.close()
     await broker.close()
   }
+})
+
+test('broker mode: the loge gets the SAME opaque lease under the broker names, and still no real secret', () => {
+  const config = baseConfig({ useBroker: true, brokerDataUrl: 'http://agent-broker.agent.svc:8788' })
+  const spec = buildLogePodSpec('conv-v', config, {
+    oauthToken: 'sk-ant-oat01-broker-LEASE456',
+    baseUrl: 'http://agent-broker.agent.svc:8788',
+    equipment: { profile: 'vault-v1', target: null },
+    leaseId: 'lease_v',
+    brokerUrl: 'http://agent-broker.agent.svc:8788',
+  }) as any
+  const env = spec.spec.containers[0].env as Array<{ name: string; value?: string }>
+  const get = (n: string) => env.find((e) => e.name === n)?.value
+  // One bearer, three names: Claude Code reads CLAUDE_CODE_OAUTH_TOKEN, the MCP config reads
+  // AGENT_BROKER_TOKEN. Same worthless lease — the broker decides what it means, not its name.
+  assert.equal(get('AGENT_BROKER_TOKEN'), 'sk-ant-oat01-broker-LEASE456')
+  assert.equal(get('CLAUDE_CODE_OAUTH_TOKEN'), 'sk-ant-oat01-broker-LEASE456')
+  assert.equal(get('AGENT_BROKER_URL'), 'http://agent-broker.agent.svc:8788')
+  // Nothing in the loge is a real credential.
+  assert.equal(env.some((e) => (e.value ?? '').includes('sk-ant-oat01-broker-') === false && /sk-ant-oat01-[A-Za-z0-9]{20}/.test(e.value ?? '')), false)
+})
+
+test('inference-proxy mode: no AGENT_BROKER_* at all — there is no broker on that path', () => {
+  const spec = buildLogePodSpec('conv-p', baseConfig(), {
+    oauthToken: 'sk-ant-oat01-DISPOSSESSED-x',
+    baseUrl: 'http://10.0.0.9:8788',
+    equipment: { profile: 'chat-v1', target: null },
+  }) as any
+  const env = spec.spec.containers[0].env as Array<{ name: string }>
+  assert.equal(env.some((e) => e.name.startsWith('AGENT_BROKER_')), false)
+})
+
+test('the vault MCP server is attached ONLY to a profile that carries vault:full', () => {
+  assert.equal(mcpServersFor({ profile: 'chat-v1', target: null }), undefined, 'chat gets no vault server at all')
+  assert.equal(mcpServersFor({ profile: 'root-v1', target: null }), undefined, 'an unknown profile unlocks nothing')
+  const vault = mcpServersFor({ profile: 'vault-v1', target: null })
+  assert.ok(vault)
+  const cfg = JSON.parse(vault.config)
+  assert.equal(cfg.mcpServers.vault.type, 'http')
+  // The loge is pointed at the BROKER, never at the vault itself (plan §P5.4).
+  assert.equal(cfg.mcpServers.vault.url, '${AGENT_BROKER_URL}/v1/vault/mcp')
+  assert.equal(cfg.mcpServers.vault.url.includes('vault.bretagne.dev'), false)
+  // The bearer is NAMED, not embedded: Claude Code expands it, so it never hits argv where a `ps`
+  // inside the loge would read it off its own supervisor's command line.
+  assert.equal(cfg.mcpServers.vault.headers.Authorization, 'Bearer ${AGENT_BROKER_TOKEN}')
+  assert.equal(/sk-ant/.test(vault.config), false)
+})
+
+test('withMcpServers EXTENDS --allowedTools; it never adds a second one that could drop the channel', () => {
+  const base = ['--session-id', 'u1', '--channels', 'plugin:agora@agora', '--allowedTools', 'mcp__plugin_agora_agora__reply', '--dangerously-skip-permissions']
+  const out = withMcpServers(base, { profile: 'vault-v1', target: null }) as string[]
+
+  assert.equal(out.filter((a) => a === '--allowedTools').length, 1, 'exactly one --allowedTools, or last-wins eats the channel')
+  const tools = out[out.indexOf('--allowedTools') + 1]
+  assert.equal(tools, 'mcp__plugin_agora_agora__reply,mcp__vault__*')
+  assert.ok(tools.includes('mcp__plugin_agora_agora__reply'), 'a loge that cannot reply is a run that hangs')
+  assert.ok(out.includes('--mcp-config'))
+  // Not strict: whether it also kills the plugin-provided channel server is undocumented, and the
+  // channel is what makes a run work at all.
+  assert.equal(out.includes('--strict-mcp-config'), false)
+  assert.equal(base.includes('--mcp-config'), false, "the caller's array is not mutated")
+})
+
+test('withMcpServers leaves a chat spawn byte-for-byte untouched', () => {
+  const base = ['--session-id', 'u1', '--allowedTools', 'mcp__plugin_agora_agora__reply']
+  assert.deepEqual(withMcpServers(base, { profile: 'chat-v1', target: null }), base)
 })

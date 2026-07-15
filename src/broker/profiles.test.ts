@@ -9,13 +9,19 @@ import {
   projectedTargets,
 } from './profiles.js'
 
-test('catalogue: chat-v1 is the enabled default; higher profiles are gated off', () => {
-  assert.equal(CATALOGUE['chat-v1'].enabled, true)
-  assert.equal(CATALOGUE['chat-v1'].visible, true)
-  for (const n of ['vault-v1', 'repo-read-v1', 'repo-dev-v1', 'repo-dev-vault-v1']) {
-    assert.equal(CATALOGUE[n].enabled, false, `${n} must stay disabled until its palier`)
+test('catalogue: chat + vault are open (P5); every repo profile is still gated off', () => {
+  // This test IS the gate's tripwire: opening a profile has to be a deliberate edit here, never a
+  // side effect of some other change. Each name below is a real capability over Arnault's data.
+  for (const n of ['chat-v1', 'vault-v1']) {
+    assert.equal(CATALOGUE[n].enabled, true, `${n} is open as of P5`)
+    assert.equal(CATALOGUE[n].visible, true)
   }
-  assert.deepEqual([...CATALOGUE['chat-v1'].capabilities], ['claude:invoke'])
+  for (const n of ['repo-read-v1', 'repo-dev-v1', 'repo-dev-vault-v1']) {
+    assert.equal(CATALOGUE[n].enabled, false, `${n} must stay disabled until its palier`)
+    assert.equal(CATALOGUE[n].visible, false, `${n} must not even be offered in the UI`)
+  }
+  assert.deepEqual([...CATALOGUE['chat-v1'].capabilities], ['claude:invoke'], 'chat must never gain a capability by accident')
+  assert.deepEqual([...CATALOGUE['vault-v1'].capabilities], ['claude:invoke', 'vault:full'])
 })
 
 test('getProfile: known vs unknown, no prototype pollution', () => {
