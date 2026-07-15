@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { K8sClient, type K8sPods, type HttpError } from './k8s.js'
 import { KNOWN_KINDS, isKnownKind } from './runtimes.js'
 import { getCapabilities } from './capabilities.js'
-import { DEFAULT_PROFILE, checkProfileTarget } from './broker/profiles.js'
+import { DEFAULT_PROFILE, checkProfileTarget, getProfile } from './broker/profiles.js'
 
 /**
  * The manager (agent-runtime ADR 0010 §1.1/§1.3): a superset of the supervisor's own control API.
@@ -130,6 +130,57 @@ export function stripMintedEnv(raw: unknown): { env?: Record<string, unknown>; d
   return { env, dropped }
 }
 
+/**
+ * The MCP servers a profile's capabilities earn it (plan §P5.4). Capability -> server lives HERE, in
+ * the same module as the catalogue: agora names a profile and must never learn what it unlocks.
+ *
+ * The config NAMES env vars instead of embedding the lease. Claude Code expands `${VAR}` in `url` and
+ * `headers`, so the bearer never reaches the command line — where a `ps` inside the loge would read
+ * it straight off the argv of its own supervisor.
+ *
+ * A profile without `vault:full` gets NO vault server at all, rather than a configured-but-403 one:
+ * a server that fails on every call would show the agent tools it cannot use, and a failing MCP
+ * server at boot is exactly what once wedged runs at `starting`.
+ */
+export function mcpServersFor(equipment: Equipment): { config: string; tools: string[] } | undefined {
+  const profile = getProfile(equipment.profile)
+  if (!profile?.capabilities.includes('vault:full')) return undefined
+  return {
+    config: JSON.stringify({
+      mcpServers: {
+        vault: {
+          type: 'http',
+          url: '${AGENT_BROKER_URL}/v1/vault/mcp',
+          headers: { Authorization: 'Bearer ${AGENT_BROKER_TOKEN}' },
+        },
+      },
+    }),
+    tools: ['mcp__vault__*'],
+  }
+}
+
+/**
+ * Append the profile's MCP servers to a spawn's args.
+ *
+ * `--allowedTools` is EXTENDED, never re-added: a second flag would let last-wins silently drop the
+ * channel's own reply/set_title tools, and a loge that cannot reply is a run that hangs.
+ *
+ * Deliberately no `--strict-mcp-config`: whether it also disables the plugin-provided channel server
+ * is undocumented, and the channel is what makes a run work at all. The loge has no other MCP source
+ * to exclude today (fresh HOME, baked settings.json). Revisit at P6, where a cloned repo could carry
+ * its own .mcp.json — THAT is the vector strict actually closes.
+ */
+export function withMcpServers(args: unknown, equipment: Equipment): unknown {
+  const mcp = mcpServersFor(equipment)
+  if (!mcp || !Array.isArray(args)) return args
+  const out = [...(args as string[])]
+  const i = out.indexOf('--allowedTools')
+  if (i >= 0 && typeof out[i + 1] === 'string') out[i + 1] = `${out[i + 1]},${mcp.tools.join(',')}`
+  else out.push('--allowedTools', mcp.tools.join(','))
+  out.push('--mcp-config', mcp.config)
+  return out
+}
+
 /** Everything the manager MINTS and hands a loge at birth. Never sourced from a spawn body: the
  *  manager is the only party that may decide what credential a loge holds (plan §2.6). */
 export interface LogeCustody {
@@ -141,12 +192,15 @@ export interface LogeCustody {
   equipment: Equipment
   /** The lease's ID (never its token — plan §2.6) — recorded so a restarted manager can still revoke it. */
   leaseId?: string
+  /** The broker data plane, when the loge is on the broker path — exported as AGENT_BROKER_URL so the
+   *  loge's MCP config can name it. Absent on the inference-proxy path, which has no broker. */
+  brokerUrl?: string
 }
 
 /** The loge pod template (agent-runtime ADR 0010 §6 / infra-k8s ADR 0028 §3) — pinned here as the
  *  single source of truth; the plan's yaml is the spec this must match. */
 export function buildLogePodSpec(group: string, config: ManagerConfig, custody: LogeCustody): Record<string, unknown> {
-  const { oauthToken, baseUrl, equipment, leaseId } = custody
+  const { oauthToken, baseUrl, equipment, leaseId, brokerUrl } = custody
   return {
     apiVersion: 'v1',
     kind: 'Pod',
@@ -218,6 +272,17 @@ export function buildLogePodSpec(group: string, config: ManagerConfig, custody: 
             // isolated claude-adapter). Either way the loge has nothing worth stealing.
             { name: 'CLAUDE_CODE_OAUTH_TOKEN', value: oauthToken },
             { name: 'ANTHROPIC_BASE_URL', value: baseUrl },
+            // The SAME opaque lease under the names the non-Anthropic surfaces use (plan §2.6). It is
+            // the one bearer this loge has, and it is worthless to any provider: the broker maps it to
+            // real access on its own side. Set on every loge, including chat-only ones — holding the
+            // lease grants nothing; only the lease's PROFILE decides what the broker will do with it,
+            // and a chat lease gets 403 on /v1/vault/* (proven by the adapter's tests).
+            ...(brokerUrl
+              ? [
+                  { name: 'AGENT_BROKER_TOKEN', value: oauthToken },
+                  { name: 'AGENT_BROKER_URL', value: brokerUrl },
+                ]
+              : []),
             { name: 'DISABLE_AUTOUPDATER', value: '1' },
           ],
           securityContext: {
@@ -489,6 +554,9 @@ export class Manager {
         if (resolved !== null) forwarded.transcript = { sessionUuid: resumeUuid, content: resolved }
       }
 
+      // The profile's MCP servers are attached HERE, not by agora: only this side knows what a
+      // profile unlocks, and only this side has already validated it.
+      forwarded.args = withMcpServers(forwarded.args, equipment)
       const result = await this.forwardSpawn(`http://${loge.podIp}:8080`, forwarded)
       if (result.status >= 200 && result.status < 300) {
         // Running now — the loge reports it via its own /sessions; drop the creating marker.
@@ -581,11 +649,13 @@ export class Manager {
     let oauthToken: string
     let baseUrl: string
     let leaseId: string | undefined
+    let brokerUrl: string | undefined
     if (this.deps.config.useBroker) {
       const lease = await this.mintLease(group, equipment)
       if (!lease) return { error: 'quota_exceeded' } // broker unreachable → provision failure (rollback: USE_BROKER=false)
       oauthToken = lease.token
       baseUrl = this.deps.config.brokerDataUrl
+      brokerUrl = this.deps.config.brokerDataUrl
       leaseId = lease.leaseId
     } else {
       const proxyBaseUrl = await this.ensureProxyBaseUrl()
@@ -597,7 +667,7 @@ export class Manager {
     await this.createGate.acquire()
     try {
       const podName = `loge-${group}`
-      const spec = buildLogePodSpec(group, this.deps.config, { oauthToken, baseUrl, equipment, leaseId })
+      const spec = buildLogePodSpec(group, this.deps.config, { oauthToken, baseUrl, equipment, leaseId, brokerUrl })
       let pod: any
       try {
         pod = await this.deps.k8s.createPod(spec)
