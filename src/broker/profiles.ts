@@ -3,9 +3,26 @@
  *
  * The security authority for what a lease may do. A lease names a *profile*; the
  * broker maps that name to a fixed capability set here — never an arbitrary list
- * from the browser. `target` (repo profiles) is normalised to lowercase, checked
- * against an allow-list, and `infra-k8s` is hard-denied regardless of what the
- * GitHub App is actually installed on (plan invariant #10).
+ * from the browser.
+ *
+ * No profile takes a `target` any more (P6). Scoping a repo per run was friction without safety:
+ * GitHub has no permission that separates "push a branch" from "push main", so the line between
+ * proposing and disposing is drawn by the repository RULESET, not by a token's repo scope — and
+ * scoping READ protects nothing on repos that are public anyway. The target plumbing survives in
+ * the types and the run facts (additive, harmless); nothing sets one.
+ *
+ * There is no repo deny-list either, including for `infra-k8s`. That was plan invariant #10, and it
+ * is deliberately dropped: with the repository RULESET active (PR + an approving review the App
+ * cannot give itself, no force-push, no deletion, App not a bypass actor), the deny-list only
+ * stopped an agent from OPENING a pull request — noise, not compromise. Meanwhile it barred agents
+ * from the infra work that is most of this platform's actual workload.
+ *
+ * What keeps an agent from editing what confines it is therefore, in order:
+ *   1. it cannot merge — the ruleset requires a review, and nobody approves their own PR;
+ *   2. it cannot disable the ruleset — the App has no `Administration` permission;
+ *   3. a human reads the diff before approving. On infra-k8s that human must not be a rubber stamp:
+ *      that repo's manifests ARE the confinement (NetworkPolicies, USE_BROKER, the catalogue).
+ * Point 3 is process, not code, and this file cannot enforce it.
  */
 
 export interface Profile {
@@ -64,30 +81,38 @@ export const CATALOGUE: Readonly<Record<string, Profile>> = Object.freeze({
     true,
     true,
   ),
+  // No target: scoping READ to one repo protects nothing — every repo is public, and the loge has no
+  // internet, so the broker is already the only door. Asking the human to pick a repo up front just
+  // broke the real workflow (this very migration spans four repos at once).
   'repo-read-v1': profile(
     'repo-read-v1',
-    'Dépôt — lecture',
-    'Lecture seule du dépôt choisi.',
+    'Dépôts — lecture',
+    'Lecture de tous tes dépôts GitHub.',
     ['claude:invoke', 'github:contents:read', 'github:metadata:read'],
-    true,
+    false,
     false,
     false,
   ),
+  // No target either: GitHub has no permission that says "push branches but never main" (proven —
+  // `contents: write` reaches the default branch, and without it an agent cannot even create a
+  // branch). The line between proposing and disposing is drawn by the repository RULESET, not by the
+  // token's repo scope. So scoping to one repo buys friction, not safety. Stays disabled until P6.6
+  // proves the App cannot push to main nor merge its own PR.
   'repo-dev-v1': profile(
     'repo-dev-v1',
-    'Dépôt — écriture',
-    'Lecture et écriture sur le dépôt choisi.',
-    ['claude:invoke', 'github:metadata:read', 'github:contents:read', 'github:contents:write'],
-    true,
+    'Dépôts — écriture',
+    'Peut ouvrir des PR sur tes dépôts (jamais pousser sur main).',
+    ['claude:invoke', 'github:metadata:read', 'github:contents:read', 'github:contents:write', 'github:pull_requests:write'],
+    false,
     false,
     false,
   ),
   'repo-dev-vault-v1': profile(
     'repo-dev-vault-v1',
-    'Dépôt — écriture + Vault',
-    'Lecture et écriture sur le dépôt choisi, plus tout le vault.',
-    ['claude:invoke', 'vault:full', 'github:metadata:read', 'github:contents:read', 'github:contents:write'],
-    true,
+    'Dépôts — écriture + Vault',
+    'Peut ouvrir des PR sur tes dépôts, plus tout le vault.',
+    ['claude:invoke', 'vault:full', 'github:metadata:read', 'github:contents:read', 'github:contents:write', 'github:pull_requests:write'],
+    false,
     false,
     false,
   ),
@@ -100,16 +125,6 @@ export const DEFAULT_PROFILE = 'chat-v1'
 export function getProfile(name: string): Profile | undefined {
   return Object.prototype.hasOwnProperty.call(CATALOGUE, name) ? CATALOGUE[name] : undefined
 }
-
-/** Repos an agent may ever target. Refined in P6 (owner/repo -> repository ID). `infra-k8s`
- *  is hard-denied below and MUST NOT appear here — defence in depth, plan invariant #10. */
-export const REPO_ALLOWLIST: ReadonlySet<string> = new Set([
-  'arnaultbretagne/agora',
-  'arnaultbretagne/agent-runtime',
-  'arnaultbretagne/obsidian-stack',
-])
-/** Denied before any GitHub call, whatever the allow-list or the App's installation says. */
-export const REPO_DENYLIST: ReadonlySet<string> = new Set(['arnaultbretagne/infra-k8s'])
 
 const GITHUB_TARGET_RE = /^github:([a-z0-9][a-z0-9-]*)\/([a-z0-9._-]+)$/
 
@@ -124,8 +139,6 @@ export function normalizeTarget(raw: string): TargetResult {
   const m = GITHUB_TARGET_RE.exec(lowered)
   if (!m) return { ok: false, error: 'target_malformed', detail: 'expected github:<owner>/<repo>' }
   const slug = `${m[1]}/${m[2]}`
-  if (REPO_DENYLIST.has(slug)) return { ok: false, error: 'target_denied', detail: 'repository is deny-listed' }
-  if (!REPO_ALLOWLIST.has(slug)) return { ok: false, error: 'target_denied', detail: 'repository not on the allow-list' }
   return { ok: true, target: `github:${slug}` }
 }
 
@@ -183,13 +196,3 @@ export function publicProjection(): ProjectedProfile[] {
   }))
 }
 
-/** The targets agora may offer (ADR 0012 §6: a controlled list, never a free URL), in the SAME
- *  canonical form `normalizeTarget` returns and the run records — so the value the UI picks is the
- *  value that travels, with no prefix-building anywhere downstream. Deny-listed repos are excluded
- *  by construction; agora is left with no way to name one. */
-export function projectedTargets(): string[] {
-  return [...REPO_ALLOWLIST]
-    .filter((slug) => !REPO_DENYLIST.has(slug))
-    .map((slug) => `github:${slug}`)
-    .sort()
-}

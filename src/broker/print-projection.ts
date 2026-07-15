@@ -11,7 +11,7 @@
  * A stale copy is fail-closed by construction: agora can only ever offer a name the manager then
  * re-checks against the real catalogue and refuses.
  */
-import { projectedTargets, publicProjection } from './profiles.js'
+import { publicProjection } from './profiles.js'
 
 export function projectionDocument(): string {
   return `${JSON.stringify(
@@ -19,7 +19,6 @@ export function projectionDocument(): string {
       _generated: 'agent-runtime `npm run print-projection` — do not edit by hand',
       _source: 'agent-runtime src/broker/profiles.ts (the security authority)',
       profiles: publicProjection(),
-      targets: projectedTargets(),
     },
     null,
     2,

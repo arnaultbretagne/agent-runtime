@@ -6,7 +6,6 @@ import {
   normalizeTarget,
   checkProfileTarget,
   publicProjection,
-  projectedTargets,
 } from './profiles.js'
 
 test('catalogue: chat + vault are open (P5); every repo profile is still gated off', () => {
@@ -31,11 +30,11 @@ test('getProfile: known vs unknown, no prototype pollution', () => {
   assert.equal(getProfile('__proto__'), undefined)
 })
 
-test('normalizeTarget: lowercases, allow-lists, hard-denies infra-k8s', () => {
+test('normalizeTarget: lowercases and validates syntax; GitHub does the bounding', () => {
   assert.deepEqual(normalizeTarget('github:ArnaultBretagne/Agora'), { ok: true, target: 'github:arnaultbretagne/agora' })
   assert.equal((normalizeTarget('not-a-target') as { error: string }).error, 'target_malformed')
-  assert.equal((normalizeTarget('github:arnaultbretagne/infra-k8s') as { error: string }).error, 'target_denied')
-  assert.equal((normalizeTarget('github:someone/random') as { error: string }).error, 'target_denied')
+  // Nothing is refused by name any more: the App is installed on one account, so a token for a repo
+  // that is not Arnault's cannot exist. Duplicating that as a code list only re-created friction.
 })
 
 test('checkProfileTarget: reachable P2 paths', () => {
@@ -63,15 +62,13 @@ test('publicProjection carries label + shape, never capabilities or the enabled 
   }
 })
 
-test('projectedTargets offers the allow-list, canonically, and never a denied repo', () => {
-  const targets = projectedTargets()
-  assert.ok(targets.includes('github:arnaultbretagne/agora'))
-  // Canonical end to end: what the UI offers is exactly what normalizeTarget returns, so the picked
-  // value travels unmodified and no layer has to rebuild the `github:` scheme (and get it wrong).
-  for (const t of targets) {
-    const n = normalizeTarget(t)
-    assert.equal(n.ok, true, `${t} must be a valid target`)
-    assert.equal((n as { target: string }).target, t, `${t} must already be canonical`)
-  }
-  assert.equal(targets.some((t) => t.includes('infra-k8s')), false, 'the deny-list must never be offered in the UI')
+test('no repo is barred at the token layer — including infra-k8s', () => {
+  // Plan invariant #10 (a hard infra-k8s deny-list) is deliberately dropped. With the repository
+  // ruleset active, excluding it only stopped an agent OPENING a PR — noise, not compromise — while
+  // barring agents from the infra work that is most of the real job. What actually stops an agent
+  // rewriting its own confinement: it cannot merge (a review it cannot give itself), and it cannot
+  // disable the ruleset (the App has no `Administration` permission).
+  assert.equal(normalizeTarget('github:arnaultbretagne/infra-k8s').ok, true)
+  assert.equal(normalizeTarget('github:someone/random').ok, true)
+  assert.equal((normalizeTarget('not-a-target') as { error: string }).error, 'target_malformed')
 })
