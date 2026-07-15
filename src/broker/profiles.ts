@@ -81,9 +81,11 @@ export const CATALOGUE: Readonly<Record<string, Profile>> = Object.freeze({
     true,
     true,
   ),
-  // No target: scoping READ to one repo protects nothing — every repo is public, and the loge has no
-  // internet, so the broker is already the only door. Asking the human to pick a repo up front just
-  // broke the real workflow (this very migration spans four repos at once).
+  // No target: scoping READ to one repo protects nothing, because every repo is public — a loge has
+  // world egress on 443 (kept deliberately: Claude Code has hardcoded api.anthropic.com endpoints),
+  // so it can `git clone` any of them token-free anyway. This profile buys a rate limit and a path
+  // to private repos, not secrecy. Asking the human to pick a repo up front only broke the real
+  // workflow (this very migration spans four repos at once).
   'repo-read-v1': profile(
     'repo-read-v1',
     'Dépôts — lecture',
