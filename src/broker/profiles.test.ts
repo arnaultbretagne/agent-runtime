@@ -6,7 +6,7 @@ import {
   normalizeTarget,
   checkProfileTarget,
   publicProjection,
-  projectedTargets,
+  deniedForWrite,
 } from './profiles.js'
 
 test('catalogue: chat + vault are open (P5); every repo profile is still gated off', () => {
@@ -31,11 +31,14 @@ test('getProfile: known vs unknown, no prototype pollution', () => {
   assert.equal(getProfile('__proto__'), undefined)
 })
 
-test('normalizeTarget: lowercases, allow-lists, hard-denies infra-k8s', () => {
+test('normalizeTarget: lowercases, validates syntax, hard-denies infra-k8s', () => {
   assert.deepEqual(normalizeTarget('github:ArnaultBretagne/Agora'), { ok: true, target: 'github:arnaultbretagne/agora' })
   assert.equal((normalizeTarget('not-a-target') as { error: string }).error, 'target_malformed')
   assert.equal((normalizeTarget('github:arnaultbretagne/infra-k8s') as { error: string }).error, 'target_denied')
-  assert.equal((normalizeTarget('github:someone/random') as { error: string }).error, 'target_denied')
+  // A stranger's repo is no longer refused HERE: the allow-list is gone, and GitHub is what bounds
+  // us — the App is installed on one account, so a token for someone else's repo cannot exist.
+  // Duplicating that as a code list only re-created the friction it was meant to remove.
+  assert.equal(normalizeTarget('github:someone/random').ok, true)
 })
 
 test('checkProfileTarget: reachable P2 paths', () => {
@@ -63,15 +66,17 @@ test('publicProjection carries label + shape, never capabilities or the enabled 
   }
 })
 
-test('projectedTargets offers the allow-list, canonically, and never a denied repo', () => {
-  const targets = projectedTargets()
-  assert.ok(targets.includes('github:arnaultbretagne/agora'))
-  // Canonical end to end: what the UI offers is exactly what normalizeTarget returns, so the picked
-  // value travels unmodified and no layer has to rebuild the `github:` scheme (and get it wrong).
-  for (const t of targets) {
-    const n = normalizeTarget(t)
-    assert.equal(n.ok, true, `${t} must be a valid target`)
-    assert.equal((n as { target: string }).target, t, `${t} must already be canonical`)
+test('the deny-list is the only barrier on infra-k8s, so presentation must not dodge it', () => {
+  // No allow-list any more: the App is installed on one account, so GitHub already bounds an agent
+  // to Arnault's repos. This list is what stops the ONE repo whose write undoes every other control.
+  for (const dodge of [
+    'arnaultbretagne/infra-k8s',
+    'ArnaultBretagne/Infra-K8s',
+    '  arnaultbretagne/infra-k8s  ',
+    'arnaultbretagne/infra-k8s.git',
+  ]) {
+    assert.equal(deniedForWrite(dodge), true, `${JSON.stringify(dodge)} must be denied`)
   }
-  assert.equal(targets.some((t) => t.includes('infra-k8s')), false, 'the deny-list must never be offered in the UI')
+  assert.equal(deniedForWrite('arnaultbretagne/agora'), false)
+  assert.equal(normalizeTarget('github:ArnaultBretagne/INFRA-K8S').ok, false, 'and via the target path too')
 })
