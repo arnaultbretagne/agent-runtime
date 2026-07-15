@@ -39,12 +39,3 @@ export function authorize(store: LeaseStore, authHeader: string | undefined, cap
   return a
 }
 
-export type TargetResult = { ok: true } | { ok: false; status: 403 | 409; error: string }
-
-/** A repo op must run on the lease's frozen target. No target on the lease -> 403; a request that
- *  names a *different* target -> 409 target_mismatch. */
-export function checkTarget(claims: LeaseClaims, requestedTarget: string | null | undefined): TargetResult {
-  if (!claims.target) return { ok: false, status: 403, error: 'target_denied' }
-  if (requestedTarget && requestedTarget !== claims.target) return { ok: false, status: 409, error: 'target_mismatch' }
-  return { ok: true }
-}
