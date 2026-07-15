@@ -81,19 +81,27 @@ export const CATALOGUE: Readonly<Record<string, Profile>> = Object.freeze({
     true,
     true,
   ),
-  // No target: scoping READ to one repo protects nothing, because every repo is public — a loge has
-  // world egress on 443 (kept deliberately: Claude Code has hardcoded api.anthropic.com endpoints),
-  // so it can `git clone` any of them token-free anyway. This profile buys a rate limit and a path
-  // to private repos, not secrecy. Asking the human to pick a repo up front only broke the real
-  // workflow (this very migration spans four repos at once).
+  // ENABLED 2026-07-15 (P6.5). The chain is proven live: the App mints {contents:read, metadata:read}
+  // (a WRITE App narrowed down — GitHub grants the intersection), the loge's credential helper hands
+  // it to git on a pipe and stores it nowhere, and a chat-v1 lease asking the same endpoint is
+  // refused 403 before it reaches the adapter.
+  //
+  // Be honest about what this profile buys: NOT secrecy. Every one of these repos is public and a
+  // loge has world egress on 443 (kept deliberately — Claude Code has hardcoded api.anthropic.com
+  // endpoints), so it can already `git clone` any of them token-free. What the token adds is the
+  // API rate limit (60/h anonymous -> 5000/h) and a path to a private repo if one ever exists.
+  //
+  // No target: scoping READ to one repo would protect nothing that is not already public, and asking
+  // the human to pick a repo up front only broke the real workflow (this very migration spans four
+  // repos at once).
   'repo-read-v1': profile(
     'repo-read-v1',
     'Dépôts — lecture',
-    'Lecture de tous tes dépôts GitHub.',
+    'Lecture de tous tes dépôts GitHub. Ne peut rien y écrire.',
     ['claude:invoke', 'github:contents:read', 'github:metadata:read'],
     false,
-    false,
-    false,
+    true,
+    true,
   ),
   // No target either: GitHub has no permission that says "push branches but never main" (proven —
   // `contents: write` reaches the default branch, and without it an agent cannot even create a
