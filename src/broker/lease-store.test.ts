@@ -31,8 +31,8 @@ test('mint rejects unknown, disabled, and target-mismatched profiles', () => {
   const store = new LeaseStore({ path: freshPath(), ttlMs: 60_000 })
   store.load()
   assert.equal((store.mint({ runId: 'r', profile: 'nope' }) as { error: string }).error, 'unknown_profile')
-  // repo-dev-v1 exists but is not enabled: P6.5 opened READ only, write stays shut.
-  assert.equal((store.mint({ runId: 'r', profile: 'repo-dev-v1' }) as { error: string }).error, 'profile_disabled')
+  // repo-dev-vault-v1 exists but is not enabled — the only profile still gated after P6.
+  assert.equal((store.mint({ runId: 'r', profile: 'repo-dev-vault-v1' }) as { error: string }).error, 'profile_disabled')
   // chat-v1 takes no target
   assert.equal((store.mint({ runId: 'r', profile: 'chat-v1', target: 'github:x/y' }) as { error: string }).error, 'target_forbidden')
 })

@@ -103,20 +103,35 @@ export const CATALOGUE: Readonly<Record<string, Profile>> = Object.freeze({
     true,
     true,
   ),
-  // No target either: GitHub has no permission that says "push branches but never main" (proven —
+  // ENABLED 2026-07-15 (P6). This is the one that lets an agent change Arnault's repos, so what
+  // stops it is worth stating exactly — none of it is this token:
+  //   1. The RULESET refuses a push to main (409) and refuses to merge a PR without an approving
+  //      review (405). Proven live in P6.6 against the real repos.
+  //   2. Nobody approves their own PR: every loge shares ONE identity (`k8s-broker[bot]`), so a PR
+  //      the bot opens can never be approved by the bot — GitHub refuses self-approval (422,
+  //      measured). The gate holds by construction, not by discipline.
+  //   3. The App has no `Administration` permission, so an agent cannot switch the ruleset off.
+  //   4. A human reads the diff. On infra-k8s that human must NOT be a rubber stamp: those
+  //      manifests ARE the confinement. Process, not code — this file cannot enforce it.
+  //
+  // No target: GitHub has no permission that says "push branches but never main" (proven —
   // `contents: write` reaches the default branch, and without it an agent cannot even create a
-  // branch). The line between proposing and disposing is drawn by the repository RULESET, not by the
-  // token's repo scope. So scoping to one repo buys friction, not safety. Stays disabled until P6.6
-  // proves the App cannot push to main nor merge its own PR.
+  // branch). The propose/dispose line is drawn by the RULESET, so a repo scope buys friction, not
+  // safety — and it would break the real workflow, where one change spans several repos at once.
   'repo-dev-v1': profile(
     'repo-dev-v1',
     'Dépôts — écriture',
-    'Peut ouvrir des PR sur tes dépôts (jamais pousser sur main).',
+    'Peut ouvrir des PR sur tes dépôts. Ne peut ni pousser sur main, ni merger.',
     ['claude:invoke', 'github:metadata:read', 'github:contents:read', 'github:contents:write', 'github:pull_requests:write'],
     false,
-    false,
-    false,
+    true,
+    true,
   ),
+  // Deliberately still shut, and NOT because it is riskier than the two profiles it unions — it is
+  // exactly `repo-dev-v1` + `vault-v1`, both open. It stays shut because its NAME is the symptom of
+  // a modelling problem Arnault flagged: profiles as a fixed enum of combinations does not scale (a
+  // third capability makes eight of these). Opening it would freeze that name into the run facts,
+  // where renaming costs a migration. Cheap to open the day the model is settled; expensive to undo.
   'repo-dev-vault-v1': profile(
     'repo-dev-vault-v1',
     'Dépôts — écriture + Vault',

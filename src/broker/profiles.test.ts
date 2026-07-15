@@ -8,17 +8,16 @@ import {
   publicProjection,
 } from './profiles.js'
 
-test('catalogue: chat + vault (P5) and repo READ (P6.5) are open; every WRITE profile is still gated off', () => {
+test('catalogue: chat, vault, repo read AND repo write are open (P6); only the unioned profile is gated', () => {
   // This test IS the gate's tripwire: opening a profile has to be a deliberate edit here, never a
   // side effect of some other change. Each name below is a real capability over Arnault's data.
-  for (const n of ['chat-v1', 'vault-v1', 'repo-read-v1']) {
+  for (const n of ['chat-v1', 'vault-v1', 'repo-read-v1', 'repo-dev-v1']) {
     assert.equal(CATALOGUE[n].enabled, true, `${n} is open`)
     assert.equal(CATALOGUE[n].visible, true)
   }
-  // The line that still matters. Read is nearly free (these repos are public — a loge can clone them
-  // token-free anyway); WRITE is where an agent starts changing Arnault's repos, and it stays shut
-  // until the loge can open a PR without putting the token in its own argv.
-  for (const n of ['repo-dev-v1', 'repo-dev-vault-v1']) {
+  // Still shut — not because it is riskier than the union of two open profiles, but because opening
+  // it would freeze a name Arnault has flagged as badly modelled into the run facts.
+  for (const n of ['repo-dev-vault-v1']) {
     assert.equal(CATALOGUE[n].enabled, false, `${n} must stay disabled until its palier`)
     assert.equal(CATALOGUE[n].visible, false, `${n} must not even be offered in the UI`)
   }
@@ -49,9 +48,9 @@ test('normalizeTarget: lowercases and validates syntax; GitHub does the bounding
 
 test('checkProfileTarget: reachable paths', () => {
   assert.equal((checkProfileTarget('nope', null) as { error: string }).error, 'unknown_profile')
-  // repo-dev-v1 is the still-gated profile now that P6.5 opened repo-read-v1 — rejected before the
-  // target is even considered.
-  assert.equal((checkProfileTarget('repo-dev-v1', 'github:arnaultbretagne/agora') as { error: string }).error, 'profile_disabled')
+  // repo-dev-vault-v1 is the only still-gated profile now — rejected before the target is even
+  // considered.
+  assert.equal((checkProfileTarget('repo-dev-vault-v1', 'github:arnaultbretagne/agora') as { error: string }).error, 'profile_disabled')
   assert.equal(checkProfileTarget('chat-v1', null).ok, true)
   assert.equal(checkProfileTarget('repo-read-v1', null).ok, true, 'the open read profile takes no target')
   assert.equal((checkProfileTarget('chat-v1', 'github:x/y') as { error: string }).error, 'target_forbidden')
