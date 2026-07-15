@@ -1,0 +1,27 @@
+#!/bin/sh
+# `gh` wrapper for a loge (agent-broker plan P6).
+#
+# Shadows the real gh (which lives at /opt/gh/bin/gh, off PATH) so that `gh pr create` simply works
+# inside a loge. This is ERGONOMICS, not security, and the distinction is worth keeping honest: the
+# loge already holds a GitHub token whenever git needs one, and the transcript and PTY log it might
+# land in are emptyDirs that die with the pod and are collected by nothing. Nothing here is
+# defending a boundary — it is saving an agent from hand-rolling a REST call it would get wrong.
+#
+# The token comes from `git credential fill`, i.e. through the SAME credential helper git uses, so
+# there is exactly ONE path to a GitHub token in this image and one place to audit. That also means
+# the helper's host check and the broker's capability check apply here for free: a chat-v1 lease
+# gets nothing, and gh then reports its own honest "not authenticated" error.
+#
+# The token is passed in the ENVIRONMENT, never on gh's command line: argv is world-readable via
+# /proc on this box, and `ps` is the one place a shell wrapper could leak what it was handed.
+GH_TOKEN=$(printf 'protocol=https\nhost=github.com\n\n' | GIT_TERMINAL_PROMPT=0 git credential fill 2>/dev/null | sed -n 's/^password=//p')
+
+if [ -n "$GH_TOKEN" ]; then
+  export GH_TOKEN
+else
+  # No token: do NOT fail here. gh's own "gh auth login" message is clearer than anything this
+  # wrapper could invent, and some gh subcommands (gh --help, gh --version) need no auth at all.
+  echo "[agent-broker] no GitHub token for this run's equipment — gh will run unauthenticated" >&2
+fi
+
+exec /opt/gh/bin/gh "$@"
