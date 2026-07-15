@@ -10,6 +10,10 @@
 
 export interface Profile {
   readonly name: string
+  /** Human label + description: the ONLY prose the agora projection carries (agora ADR 0012 §5).
+   *  Kept here so the catalogue stays the single source for what a profile is and is called. */
+  readonly label: string
+  readonly description: string
   readonly capabilities: readonly string[]
   readonly targetRequired: boolean
   readonly visible: boolean // exposed in the agora projection
@@ -18,19 +22,47 @@ export interface Profile {
 
 const profile = (
   name: string,
+  label: string,
+  description: string,
   capabilities: string[],
   targetRequired: boolean,
   visible: boolean,
   enabled: boolean,
-): Profile => ({ name, capabilities: Object.freeze(capabilities), targetRequired, visible, enabled })
+): Profile => ({
+  name,
+  label,
+  description,
+  capabilities: Object.freeze(capabilities),
+  targetRequired,
+  visible,
+  enabled,
+})
 
 /** The v1 catalogue (plan §2.2). Disabled/invisible profiles exist in code but are
  *  not grantable until their palier flips `enabled`. */
 export const CATALOGUE: Readonly<Record<string, Profile>> = Object.freeze({
-  'chat-v1': profile('chat-v1', ['claude:invoke'], false, true, true),
-  'vault-v1': profile('vault-v1', ['claude:invoke', 'vault:full'], false, false, false),
+  'chat-v1': profile(
+    'chat-v1',
+    'Chat',
+    'Conversation seule. Aucun accès au vault ni à un dépôt.',
+    ['claude:invoke'],
+    false,
+    true,
+    true,
+  ),
+  'vault-v1': profile(
+    'vault-v1',
+    'Vault',
+    'Lecture et écriture sur tout le vault Obsidian.',
+    ['claude:invoke', 'vault:full'],
+    false,
+    false,
+    false,
+  ),
   'repo-read-v1': profile(
     'repo-read-v1',
+    'Dépôt — lecture',
+    'Lecture seule du dépôt choisi.',
     ['claude:invoke', 'github:contents:read', 'github:metadata:read'],
     true,
     false,
@@ -38,6 +70,8 @@ export const CATALOGUE: Readonly<Record<string, Profile>> = Object.freeze({
   ),
   'repo-dev-v1': profile(
     'repo-dev-v1',
+    'Dépôt — écriture',
+    'Lecture et écriture sur le dépôt choisi.',
     ['claude:invoke', 'github:metadata:read', 'github:contents:read', 'github:contents:write'],
     true,
     false,
@@ -45,12 +79,18 @@ export const CATALOGUE: Readonly<Record<string, Profile>> = Object.freeze({
   ),
   'repo-dev-vault-v1': profile(
     'repo-dev-vault-v1',
+    'Dépôt — écriture + Vault',
+    'Lecture et écriture sur le dépôt choisi, plus tout le vault.',
     ['claude:invoke', 'vault:full', 'github:metadata:read', 'github:contents:read', 'github:contents:write'],
     true,
     false,
     false,
   ),
 })
+
+/** The profile every run gets when none is named: the floor, and the only one enabled before P5/P6.
+ *  A hub that predates equipment (or a bare API call) lands here — never on a privileged profile. */
+export const DEFAULT_PROFILE = 'chat-v1'
 
 export function getProfile(name: string): Profile | undefined {
   return Object.prototype.hasOwnProperty.call(CATALOGUE, name) ? CATALOGUE[name] : undefined
@@ -112,8 +152,34 @@ export function checkProfileTarget(profileName: string, rawTarget: string | null
   return { ok: true, profile: p, target: null }
 }
 
-/** The build-time projection agora consumes (agora ADR 0012): labels + shape only, never the
- *  capability lists. The manager stays the final authority. */
-export function publicProjection(): Array<{ name: string; needsTarget: boolean; visible: boolean }> {
-  return Object.values(CATALOGUE).map((p) => ({ name: p.name, needsTarget: p.targetRequired, visible: p.visible }))
+export interface ProjectedProfile {
+  name: string
+  label: string
+  description: string
+  needsTarget: boolean
+  visible: boolean
+}
+
+/**
+ * The build-time projection agora consumes (agora ADR 0012 §5): what to CALL a profile and what
+ * shape its form takes — never the capability lists, never `enabled`. agora renders it; the
+ * manager stays the final authority and re-checks every mint against the real catalogue, so a
+ * stale projection can only ever offer a profile the manager then refuses (fail-closed).
+ *
+ * `npm run print-projection` emits this as the JSON agora vendors in `shared/`.
+ */
+export function publicProjection(): ProjectedProfile[] {
+  return Object.values(CATALOGUE).map((p) => ({
+    name: p.name,
+    label: p.label,
+    description: p.description,
+    needsTarget: p.targetRequired,
+    visible: p.visible,
+  }))
+}
+
+/** The repos an allow-listed target may name, projected for agora's autocomplete (ADR 0012 §6:
+ *  a controlled list, never a free URL). Deny-listed repos are excluded by construction. */
+export function projectedTargets(): string[] {
+  return [...REPO_ALLOWLIST].filter((slug) => !REPO_DENYLIST.has(slug)).sort()
 }

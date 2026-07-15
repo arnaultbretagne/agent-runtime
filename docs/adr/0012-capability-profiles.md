@@ -48,6 +48,28 @@ A loge cannot choose or widen its profile after creation (ADR 0011 §2). Changin
 creates a **new run** (agora ADR 0012), never a silent mutation of a live one. Combined profiles
 (`repo-dev-vault-v1`) are not exposed in the UI until a concrete need justifies them.
 
+#### Amendment (2026-07-15, P4) — a new run is not enough: equipment is part of a loge's identity
+
+"A new run" was underspecified, and read literally it left the hole this ADR exists to close. A loge is
+get-or-create'd per **group** (the conversation) and outlives the runs inside it, while its lease is
+minted once and injected into the pod env at creation. So a *new run* alone would land in the *old
+loge* and inherit its lease: switch `vault-v1` → `chat-v1` and the "chat" run keeps `vault:full`, with
+the run journalling a profile it is not actually confined to. The fact would be a lie, and §4's promise
+with it.
+
+Therefore `(profile, target)` is part of a loge's identity. `getOrCreateLoge` reuses a loge only when
+its equipment matches; otherwise it **drains, deletes and replaces** it, revoking the old lease. Neither
+half can change in place — a lease's claims are frozen at mint, a pod's env at creation — so replacement
+is the only sound move. The equipment rides on the pod (profile as a label, target as an annotation)
+because the manager is jetable: after a restart, the cluster is the only truth about what a live loge
+was equipped with. The lease id rides there too, so a restarted manager can still revoke a lease its
+predecessor minted rather than leak it to its TTL.
+
+Cost: switching equipment forces a cold loge (~10s), the same price the product already pays for any
+other config change (agora ADR 0010). The drain is what keeps that price honest — the loge holds the
+only live copy of its native transcripts, so skipping it would turn a settings change into a silent
+history reset (ADR 0007).
+
 ### 5. Authority split
 
 - The **security authority** for the catalogue lives here, in `agent-runtime`.
