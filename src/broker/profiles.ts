@@ -178,8 +178,13 @@ export function publicProjection(): ProjectedProfile[] {
   }))
 }
 
-/** The repos an allow-listed target may name, projected for agora's autocomplete (ADR 0012 §6:
- *  a controlled list, never a free URL). Deny-listed repos are excluded by construction. */
+/** The targets agora may offer (ADR 0012 §6: a controlled list, never a free URL), in the SAME
+ *  canonical form `normalizeTarget` returns and the run records — so the value the UI picks is the
+ *  value that travels, with no prefix-building anywhere downstream. Deny-listed repos are excluded
+ *  by construction; agora is left with no way to name one. */
 export function projectedTargets(): string[] {
-  return [...REPO_ALLOWLIST].filter((slug) => !REPO_DENYLIST.has(slug)).sort()
+  return [...REPO_ALLOWLIST]
+    .filter((slug) => !REPO_DENYLIST.has(slug))
+    .map((slug) => `github:${slug}`)
+    .sort()
 }

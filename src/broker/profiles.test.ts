@@ -57,8 +57,15 @@ test('publicProjection carries label + shape, never capabilities or the enabled 
   }
 })
 
-test('projectedTargets offers the allow-list and never a denied repo', () => {
+test('projectedTargets offers the allow-list, canonically, and never a denied repo', () => {
   const targets = projectedTargets()
-  assert.ok(targets.includes('arnaultbretagne/agora'))
-  assert.equal(targets.includes('arnaultbretagne/infra-k8s'), false, 'the deny-list must never be offered in the UI')
+  assert.ok(targets.includes('github:arnaultbretagne/agora'))
+  // Canonical end to end: what the UI offers is exactly what normalizeTarget returns, so the picked
+  // value travels unmodified and no layer has to rebuild the `github:` scheme (and get it wrong).
+  for (const t of targets) {
+    const n = normalizeTarget(t)
+    assert.equal(n.ok, true, `${t} must be a valid target`)
+    assert.equal((n as { target: string }).target, t, `${t} must already be canonical`)
+  }
+  assert.equal(targets.some((t) => t.includes('infra-k8s')), false, 'the deny-list must never be offered in the UI')
 })
